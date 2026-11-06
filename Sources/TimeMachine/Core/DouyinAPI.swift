@@ -103,6 +103,19 @@ final class DouyinAPI {
         return j["data"].array.compactMap { Aweme($0["aweme_info"]) }
     }
 
+    // MARK: 话题
+
+    /// 话题页视频列表。sortType：0 热门，1 最新
+    func challengeVideos(chId: String, cursor: Int = 0, sortType: Int = 0) async throws -> (awemes: [Aweme], hasMore: Bool, cursor: Int) {
+        let j = try await bridge.get("/aweme/v1/web/challenge/aweme/", [
+            "ch_id": chId,
+            "cursor": String(cursor),
+            "count": "20",
+            "sort_type": String(sortType),
+        ])
+        return (j["aweme_list"].array.compactMap { Aweme($0) }, j["has_more"].bool ?? false, j["cursor"].int ?? 0)
+    }
+
     // MARK: 用户
 
     func selfProfile() async throws -> UserProfile? {

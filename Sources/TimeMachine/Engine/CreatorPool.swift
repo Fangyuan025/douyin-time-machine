@@ -24,6 +24,16 @@ struct Creator: Codable, Identifiable {
     var goodScans: Int?
     /// 作品热度（log10 互动量的滑动平均），用来优先挑“作品更火”的创作者
     var hotScore: Double?
+    var followerCount: Int?
+    var isInstitution: Bool?
+
+    /// 普通人（素人）创作者：非机构、粉丝不过百万（未知时按作品热度判断）
+    var isAmateur: Bool {
+        if isInstitution == true { return false }
+        if let f = followerCount { return f < 1_000_000 }
+        if let h = hotScore { return h < 4.8 }
+        return true
+    }
 
     var id: String { secUid }
 
@@ -65,14 +75,19 @@ struct CreatorPool: Codable {
         if var c = creators[a.secUid] {
             c.sources.insert(source)
             if followed { c.followed = true }
+            if let f = a.followerCount { c.followerCount = f }
+            if let i = a.isInstitution { c.isInstitution = i }
             if a.nickname != "抖音用户" { c.nickname = a.nickname }
             if let av = a.avatarURL { c.avatarURL = av }
             if c.uid.isEmpty { c.uid = a.uid }
             creators[a.secUid] = c
             return false
         }
-        creators[a.secUid] = Creator(secUid: a.secUid, uid: a.uid, nickname: a.nickname, avatarURL: a.avatarURL,
-                                     sources: [source], followed: followed, addedAt: Date())
+        var c = Creator(secUid: a.secUid, uid: a.uid, nickname: a.nickname, avatarURL: a.avatarURL,
+                        sources: [source], followed: followed, addedAt: Date())
+        c.followerCount = a.followerCount
+        c.isInstitution = a.isInstitution
+        creators[a.secUid] = c
         if creators.count > 4000 { pruneCreators() }
         return true
     }

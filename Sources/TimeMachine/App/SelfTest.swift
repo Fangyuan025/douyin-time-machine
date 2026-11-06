@@ -7,6 +7,8 @@ enum SelfTest {
         AppLog.shared.echoToStdout = true
         Task {
             let model = AppModel.shared
+            // 自检刷到的视频不算“你看过 / 最近展示过”
+            model.engine.persistFreshness = false
             let api = model.api
             var ok = true
             func check(_ name: String, _ body: () async throws -> String) async {
@@ -148,6 +150,53 @@ enum SelfTest {
                 print("\(diverse ? "✅" : "❌") 连刷 \(shown.count) 条：\(authors) 位不同作者，\(cats.count) 个内容大类（\(cats.prefix(8).joined(separator: "、"))）")
                 print("   同一作者最小间隔：\(minGap == Int.max ? "无重复" : "\(minGap) 条")；其中来自关注的人：\(followedShare) 条")
                 print("   推荐理由分布：\(reasons.sorted { $0.value > $1.value }.map { "\($0.key)×\($0.value)" }.joined(separator: "  "))")
+                let topReason = reasons.filter { $0.key.hasPrefix("当时的热点") }.values.max() ?? 0
+                let notFlooded = topReason <= max(4, shown.count / 3)
+                if !notFlooded { ok = false }
+                print("\(notFlooded ? "✅" : "❌") 热点不刷屏：单个热点最多 \(topReason) 条")
+                let mix = engine.slotMix
+                let amateurN = mix["amateur"] ?? 0
+                let mixOK = amateurN * 100 / max(1, mix.values.reduce(0, +)) >= 20
+                if !mixOK { ok = false }
+                print("\(mixOK ? "✅" : "❌") 推荐页配比（全年）：热点 \(mix["era"] ?? 0) · 热门 \(mix["hot"] ?? 0) · 普通人 \(amateurN) · \(engine.poolMix)")
+
+                // 时代感：疫情暴发（2020-02）与动态清零高峰（2022-04）都应该刷到大量相关内容
+                let pandemicWords = ["武汉", "疫情", "口罩", "抗疫", "隔离", "宅家", "火神山", "雷神山", "钟南山", "复工", "肺炎",
+                                     "防疫", "医护", "白衣", "病毒", "在家", "中国加油", "加油中国", "云监工", "居家", "抗击", "逆行",
+                                     "核酸", "大白", "团购", "方舱", "抗原", "健康码", "封控", "静默", "物资", "志愿者", "上海加油", "解封"]
+                for ym in [YearMonth(year: 2020, month: 2), YearMonth(year: 2022, month: 4)] {
+                    engine.travel(to: .single(ym))
+                    var n = 0, t = 0
+                    while n < 12 && t < 160 {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        t += 1
+                        if engine.aheadCount > 0 { engine.move(by: 1); n += 1 }
+                    }
+                    let shown = Array(engine.items.prefix(engine.currentIndex + 1))
+                    if let dump = ProcessInfo.processInfo.environment["TM_SELFTEST_DUMP"] {
+                        let line = "\(ym.short)\t" + shown.map(\.author.secUid).joined(separator: ",") + "\t" + shown.map(\.id).joined(separator: ",") + "\n"
+                        if let h = FileHandle(forWritingAtPath: dump) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); h.closeFile() }
+                        else { try? line.write(toFile: dump, atomically: true, encoding: .utf8) }
+                    }
+                    let related = shown.filter { a in
+                        let text = a.desc + " " + a.hashtags.joined(separator: " ")
+                        return pandemicWords.contains { text.contains($0) }
+                    }
+                    let share = shown.isEmpty ? 0 : related.count * 100 / shown.count
+                    let eraOK = shown.count >= 8 && share >= 30 && share <= 90
+                    if !eraOK { ok = false }
+                    print("\(eraOK ? "✅" : "❌") 时代感（\(ym)）：刷到 \(shown.count) 条，疫情相关 \(related.count) 条（\(share)%），作者 \(Set(shown.map(\.author.secUid)).count) 位")
+                    var termCounts: [String: Int] = [:]
+                    for a in shown { if let r = a.reason, let t = r.components(separatedBy: "：").dropFirst().first { termCounts[t, default: 0] += 1 } }
+                    let maxTerm = termCounts.values.max() ?? 0
+                    if maxTerm > 4 { ok = false }
+                    print("\(maxTerm > 4 ? "❌" : "✅") 同一热点词最多 \(maxTerm) 条")
+                    let m = engine.slotMix
+                    print("   配比：热点 \(m["era"] ?? 0) · 热门 \(m["hot"] ?? 0) · 普通人 \(m["amateur"] ?? 0) · \(engine.poolMix)")
+                    for a in shown.prefix(12) {
+                        print("   · \(Fmt.dayFormatter.string(from: a.date)) @\(a.author.nickname)「\(a.reason ?? "-")」\(a.desc.prefix(26))")
+                    }
+                }
             }
             print(ok ? "SELFTEST PASS" : "SELFTEST DONE WITH FAILURES")
             fflush(stdout)

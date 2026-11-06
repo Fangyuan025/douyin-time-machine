@@ -42,7 +42,8 @@ final class TimeMachineEngine {
         case seedLikes
         case feed
         case creator(Creator)
-        case search(String)
+        case search(String, offset: Int)
+        case topic(name: String, id: String, cursor: Int, sort: Int)
         case related(String)
         case wait
     }
@@ -59,7 +60,20 @@ final class TimeMachineEngine {
         var keyword: String?
         /// true：翻创作者当年的作品找到的；false：直接从推荐流 / 搜索 / 相关推荐里刷到的
         var viaScan: Bool
+        /// 入池时就命中的时间线热点词（用于平衡候选池里热点内容的占比）
+        var curatedEra: String? = nil
+        /// 普通人的日常内容（非机构、粉丝不过百万、互动适中、偏生活类）
+        var amateur: Bool = false
     }
+
+    /// 推荐页里的三类“位置”：当时的热点 / 当时的热门 / 可能感兴趣的普通人
+    private enum Slot: String { case era, hot, amateur }
+
+    /// 偏生活日常、普通人常拍的内容分类
+    private static let everydayCategories: Set<String> = [
+        "舞蹈", "随拍", "生活记录", "日常vlog", "萌宠", "宠物", "动物", "美食", "颜值", "搞笑", "情感", "运动", "健身",
+        "穿搭", "时尚", "校园", "旅行", "旅游", "亲子", "音乐", "才艺", "手工", "三农", "家居", "美妆", "彩妆",
+    ]
 
     private(set) var window: TimeWindow
     private(set) var items: [Aweme] = []
@@ -91,11 +105,17 @@ final class TimeMachineEngine {
         }
     }
     @ObservationIgnored var hideSeen = true
+    /// 是否保存“最近出现过”的记录（自检时关闭，避免测试刷到的视频影响真实使用）
+    @ObservationIgnored var persistFreshness = true
     @ObservationIgnored var onItemsChanged: (() -> Void)?
 
     @ObservationIgnored private(set) var interest: InterestProfile
     @ObservationIgnored private(set) var pool: CreatorPool
     @ObservationIgnored private(set) var seen: SeenStore
+    @ObservationIgnored private var topicDirectory: [String: String]
+    /// 最近出现过的作者 / 视频（跨会话保存），让每次刷新都有新鲜感
+    @ObservationIgnored private var recentAuthors: [String: Date]
+    @ObservationIgnored private var recentVideos: [String: Date]
 
     @ObservationIgnored private var candidates: [Candidate] = []
     @ObservationIgnored private var knownIDs = Set<String>()
@@ -119,7 +139,27 @@ final class TimeMachineEngine {
     @ObservationIgnored private var feedPagesThisWindow = 0
     @ObservationIgnored private var searchesThisWindow = 0
     @ObservationIgnored private var searchDisabled = false
-    @ObservationIgnored private var keywordQueue: [String] = []
+    /// 待搜索的关键词：当月热点 → 话题滚雪球发现的热门话题 → 季节性话题
+    @ObservationIgnored private var searchQueue: [(kw: String, offset: Int)] = []
+    @ObservationIgnored private var searchedKeywords = Set<String>()
+    /// 话题滚雪球：本次航程命中视频里的话题热度
+    @ObservationIgnored private var topicWeights: [String: Double] = [:]
+    @ObservationIgnored private var topicCounts: [String: Int] = [:]
+    @ObservationIgnored private var topicIDs: [String: String] = [:]
+    @ObservationIgnored private var topicQueue: [(name: String, id: String, cursor: Int, sort: Int)] = []
+    @ObservationIgnored private var topicAuthors: [String: Set<String>] = [:]
+    /// 每个话题本次航程已经翻过的页数（每个话题最多 2 页，避免一个热门话题灌满候选池）
+    @ObservationIgnored private var topicPages: [String: Int] = [:]
+    /// 本时间段值得翻话题页的热点词；还没拿到话题 ID 的先挂着，一旦在任何视频里见到就立刻加入
+    @ObservationIgnored private var pendingEraTopics = Set<String>()
+    /// 话题目录（话题名 → ID），从刷到的每一条视频里收集，长期保存
+    @ObservationIgnored private var exploredTopics = Set<String>()
+    @ObservationIgnored private var topicsThisWindow = 0
+    @ObservationIgnored private var eraTermCache: [Int: [String]] = [:]
+    /// 已入队视频命中的时代热点（用于避免连续几条都是同一个热点）
+    @ObservationIgnored private var itemEraTerm: [String: String] = [:]
+    /// 已入队视频占的推荐页位置
+    @ObservationIgnored private var itemSlot: [String: Slot] = [:]
     @ObservationIgnored private var relatedQueue: [String] = []
     @ObservationIgnored private var errorsInRow = 0
     /// 出错后的退避截止时间
@@ -150,6 +190,10 @@ final class TimeMachineEngine {
         self.interest = Store.load(InterestProfile.self, "interest.json") ?? InterestProfile()
         self.pool = Store.load(CreatorPool.self, "creators.json") ?? CreatorPool()
         self.seen = Store.load(SeenStore.self, "seen.json") ?? SeenStore()
+        self.topicDirectory = Store.load([String: String].self, "topics.json") ?? [:]
+        let weekAgo = Date().addingTimeInterval(-7 * 86400)
+        self.recentAuthors = (Store.load([String: Date].self, "recent_authors.json") ?? [:]).filter { $0.value > weekAgo }
+        self.recentVideos = (Store.load([String: Date].self, "recent_videos.json") ?? [:]).filter { $0.value > weekAgo }
         self.poolSize = pool.count
         self.followingCount = pool.creators.values.filter(\.followed).count
     }
@@ -175,7 +219,20 @@ final class TimeMachineEngine {
         feedPagesThisWindow = 0
         searchesThisWindow = 0
         searchDisabled = false
-        keywordQueue = EraKeywords.keywords(for: w).shuffled()
+        searchQueue = EraKeywords.keywords(for: w).map { (kw: $0, offset: 0) }
+        searchedKeywords = []
+        topicWeights = [:]
+        topicCounts = [:]
+        topicIDs = [:]
+        topicQueue = []
+        topicAuthors = [:]
+        topicPages = [:]
+        exploredTopics = []
+        topicsThisWindow = 0
+        itemEraTerm = [:]
+        itemSlot = [:]
+        pendingEraTopics = Set(EraKeywords.topicTerms(for: w))
+        queueEraTopics()
         relatedQueue = []
         errorsInRow = 0
         backoffUntil = .distantPast
@@ -210,6 +267,7 @@ final class TimeMachineEngine {
             return false
         }
         currentIndex = target
+        markShown(items[target])
         // 用最新的兴趣画像补齐队列
         promote(force: false)
         ensureBuffer()
@@ -228,6 +286,19 @@ final class TimeMachineEngine {
         items.insert(a, at: pos)
         if andPlay { currentIndex = pos }
         onItemsChanged?()
+    }
+
+    /// 记录“真正展示过”的作者与视频（用于跨会话的新鲜度）
+    func markShown(_ a: Aweme) {
+        let now = Date()
+        recentAuthors[a.author.secUid] = now
+        recentVideos[a.id] = now
+        if recentVideos.count > 6000 {
+            for (k, _) in recentVideos.sorted(by: { $0.value < $1.value }).prefix(1000) { recentVideos[k] = nil }
+        }
+        if recentAuthors.count > 4000 {
+            for (k, _) in recentAuthors.sorted(by: { $0.value < $1.value }).prefix(800) { recentAuthors[k] = nil }
+        }
     }
 
     func updateItem(_ a: Aweme) {
@@ -262,6 +333,8 @@ final class TimeMachineEngine {
     /// 候选池是否足够支撑接下来的推荐（数量够、作者够分散）
     private var poolHealthy: Bool {
         guard candidates.count >= 10 else { return false }
+        // 热点内容很多时，至少还要有几条“当时的其他热门”可选，否则会清一色
+        if candidates.contains(where: { $0.curatedEra != nil }) && candidates.filter({ $0.curatedEra == nil }).count < 4 { return false }
         return Set(candidates.lazy.map(\.aweme.author.secUid)).count >= 8
     }
 
@@ -405,6 +478,8 @@ final class TimeMachineEngine {
             seedBusy = false
         case .search:
             searchDisabled = true
+        case .topic:
+            topicQueue.removeAll()
         case .feed, .related, .wait:
             break
         }
@@ -441,35 +516,70 @@ final class TimeMachineEngine {
         }
         if followOnly {
             eligible = eligible.filter(\.followed)
-            if !eligible.isEmpty { return .creator(pickCreator(eligible)) }
+            if !eligible.isEmpty { return .creator(pickCreator(eligible, amateur: false)) }
             return (seedBusy || inflight > 0) ? .wait : nil
         }
 
         let r = Double.random(in: 0..<1)
-        if !relatedQueue.isEmpty && r < 0.1 {
-            return .related(relatedQueue.removeFirst())
+        // 搜索与话题页是找“当时大家在看什么”最有效的途径；搜索最容易触发安全验证，所以限频：
+        // 每个时间段最多 12 次，两次之间至少隔 8 秒
+        let canSearch = !searchDisabled && searchesThisWindow < 12 && !searchQueue.isEmpty
+            && Date().timeIntervalSince(lastSearchAt) > 8
+        // 候选池里热点已经过半时先不翻话题页，去补充当时的其他热门内容
+        let eraHeavy = candidates.count >= 6 && eraShare > 0.45
+        // 普通人的日常内容不足时，优先去扫普通创作者（推荐页里本来就有大量这类视频）
+        let amateurShare = candidates.isEmpty ? 0 : Double(candidates.filter(\.amateur).count) / Double(candidates.count)
+        if !eligible.isEmpty && candidates.count >= 4 && amateurShare < 0.3 && r < 0.6 {
+            return .creator(pickCreator(eligible, amateur: true))
         }
-        // 搜索是最容易触发安全验证的接口：每个时间段最多 6 次，两次之间至少隔 15 秒
-        let canSearch = !searchDisabled && searchesThisWindow < 6 && !keywordQueue.isEmpty
-            && Date().timeIntervalSince(lastSearchAt) > 15
-        let searchChance = window.touchesRecent ? 0.05 : (stats.hits < 6 ? 0.3 : 0.1)
-        if canSearch && r >= 0.1 && r < 0.1 + searchChance {
-            return .search(keywordQueue.removeFirst())
-        }
+        let canTopic = !topicQueue.isEmpty && topicsThisWindow < 20 && (!eraHeavy || topicsThisWindow < 2)
+        // 较早的时间段：话题页是找“当时大家在看什么”最稳的入口（搜索很容易被风控挂住）
+        if canTopic && !window.touchesRecent && (topicsThisWindow < 4 || r < 0.5) { return nextTopic() }
+        // 还没有可翻的热点话题时，先试一次搜索：搜索结果里会带出这些话题的 ID
+        if canSearch && !window.touchesRecent && searchesThisWindow < 2 && topicQueue.isEmpty { return nextSearch() }
+        if canTopic && r < 0.3 { return nextTopic() }
+        if !relatedQueue.isEmpty && r >= 0.3 && r < 0.37 { return .related(relatedQueue.removeFirst()) }
+        let searchChance = window.touchesRecent ? 0.08 : 0.35
+        if canSearch && r >= 0.37 && r < 0.37 + searchChance { return nextSearch() }
         let wantFeed = eligible.count < 15 || (window.touchesRecent && r > 0.6) || r > 0.96
         if wantFeed && feedPagesThisWindow < 30 { return .feed }
-        if !eligible.isEmpty { return .creator(pickCreator(eligible)) }
-        if canSearch { return .search(keywordQueue.removeFirst()) }
+        if !eligible.isEmpty {
+            // 候选池里普通人的日常内容不足三成时，多去找普通创作者
+            let wantAmateur = amateurShare < 0.3 && Double.random(in: 0..<1) < 0.65
+            return .creator(pickCreator(eligible, amateur: wantAmateur))
+        }
+        if canSearch { return nextSearch() }
+        if canTopic { return nextTopic() }
         if !relatedQueue.isEmpty { return .related(relatedQueue.removeFirst()) }
         if feedPagesThisWindow < 30 { return .feed }
-        if seedBusy || inflight > 0 { return .wait }
+        if seedBusy || inflight > 0 || (!searchQueue.isEmpty && !searchDisabled && searchesThisWindow < 12) { return .wait }
         return nil
+    }
+
+    private func nextSearch() -> Action {
+        let q = searchQueue.removeFirst()
+        return .search(q.kw, offset: q.offset)
+    }
+
+    private func nextTopic() -> Action {
+        // 已经翻够 2 页的话题，队列里剩下的同名条目直接跳过
+        while let first = topicQueue.first, (topicPages[first.name] ?? 0) >= 2 { topicQueue.removeFirst() }
+        guard !topicQueue.isEmpty else { return .wait }
+        let t = topicQueue.removeFirst()
+        return .topic(name: t.name, id: t.id, cursor: t.cursor, sort: t.sort)
     }
 
     /// Thompson 采样：每位创作者“扫描一次能出片”的概率 θ ~ Beta(α, β)，再乘以“作品热度”系数，取最大者。
     /// 目标是广度：多扫不同的、作品火的创作者，而不是反复翻你已经喜欢的那几个人。
-    private func pickCreator(_ list: [Creator]) -> Creator {
-        let sample = list.count > 400 ? Array(list.shuffled().prefix(400)) : list
+    private func pickCreator(_ list: [Creator], amateur: Bool) -> Creator {
+        var choices = list
+        if amateur {
+            let amateurs = list.filter(\.isAmateur)
+            if amateurs.count >= 20 { choices = amateurs }
+        }
+        let sample = choices.count > 400 ? Array(choices.shuffled().prefix(400)) : choices
+        // 20% 的概率纯随机挑一位（探索），让每次出发都有意外的发现
+        if Double.random(in: 0..<1) < 0.2, let any = sample.randomElement() { return any }
         let range = window.monthIndices
 
         var best = sample[0]
@@ -495,11 +605,19 @@ final class TimeMachineEngine {
             let affinity = interest.authors[c.secUid] ?? 0
             if affinity > 0 { alpha += min(1, affinity * 0.1) } else { beta += min(4, -affinity * 0.5) }
 
+            if amateur && affinity > 0 { alpha += min(2, affinity * 0.3) }   // 找普通人时，更看“你可能感兴趣”
             var value = Self.betaSample(alpha, beta)
-            // 作品越火的创作者越优先（没有数据时按中性处理）
-            let hot = min(2.5, max(-2, (c.hotScore ?? 3.2) - 3.2))
-            value *= 1 + 0.25 * hot
+            if amateur {
+                // 找普通人：作品热度一般的人反而优先
+                let modest = min(2, max(-2, 3.8 - (c.hotScore ?? 3.6)))
+                value *= 1 + 0.2 * modest
+            } else {
+                // 作品越火的创作者越优先（没有数据时按中性处理）
+                let hot = min(2.5, max(-2, (c.hotScore ?? 3.2) - 3.2))
+                value *= 1 + 0.25 * hot
+            }
             if (authorFound[c.secUid] ?? 0) >= 2 { value *= 0.1 }
+            if let last = recentAuthors[c.secUid], Date().timeIntervalSince(last) < 3 * 86400 { value *= 0.5 }
             if value > bestValue { bestValue = value; best = c }
         }
         return best
@@ -536,6 +654,7 @@ final class TimeMachineEngine {
             defer { seedBusy = false }
             activity = "正在学习你喜欢的视频…"
             let page = try await api.likedPosts(secUid: acct.secUid, maxCursor: likesCursor)
+            learnTopics(page.awemes)
             for a in page.awemes {
                 pool.add(a.author, source: .liked)
                 interest.record(.seed, aweme: a)
@@ -553,6 +672,7 @@ final class TimeMachineEngine {
             let idx = feedRefreshIndex
             feedRefreshIndex += 1
             let list = try await api.recommendFeed(refreshIndex: idx)
+            learnTopics(list)
             for a in list where !a.isAd {
                 pool.add(a.author, source: .feed)
                 for m in a.mentions { pool.add(m, source: .mention) }
@@ -564,18 +684,38 @@ final class TimeMachineEngine {
             log("推荐流 #\(idx)：\(list.count) 条，命中 \(hits)")
         case .creator(let c):
             try await scanCreator(c, w, gen)
-        case .search(let kw):
+        case .search(let kw, let offset):
             searchesThisWindow += 1
             lastSearchAt = Date()
-            activity = "正在搜索「\(kw)」的当年爆款…"
-            let list = try await api.searchVideos(keyword: kw, sortType: w.touchesRecent ? 0 : 1)
+            searchedKeywords.insert(kw)
+            activity = "正在搜索「\(kw)」的当时爆款…"
+            // 较早的时间段按“最多点赞”排序，更容易搜到当时的爆款
+            let list = try await api.searchVideos(keyword: kw, offset: offset, sortType: w.touchesRecent ? 0 : 1)
+            learnTopics(list)
             for a in list { pool.add(a.author, source: .search) }
             guard generation == gen else { return }
             let hits = addHits(list.filter { w.contains($0.createTime) }, source: .search, keyword: kw)
-            log("搜索「\(kw)」：\(list.count) 条，命中 \(hits)")
+            // 命中率高的关键词继续翻页
+            if hits >= 4 && offset < 30 { searchQueue.insert((kw: kw, offset: offset + 15), at: 0) }
+            log("搜索「\(kw)」\(offset > 0 ? "第 \(offset / 15 + 1) 页" : "")：\(list.count) 条，命中 \(hits)")
+        case .topic(let name, let id, let cursor, let sort):
+            topicsThisWindow += 1
+            activity = "正在翻看当时的热门话题 #\(name)…"
+            let r = try await api.challengeVideos(chId: id, cursor: cursor, sortType: sort)
+            learnTopics(r.awemes)
+            for a in r.awemes { pool.add(a.author, source: .search) }
+            guard generation == gen else { return }
+            let hits = addHits(r.awemes.filter { w.contains($0.createTime) }, source: .search, keyword: "#\(name)")
+            topicPages[name, default: 0] += 1
+            // 命中多就继续往下翻，但每个话题最多 2 页
+            if hits >= 3 && r.hasMore && r.cursor > cursor && (topicPages[name] ?? 0) < 2 {
+                topicQueue.insert((name: name, id: id, cursor: r.cursor, sort: sort), at: 0)
+            }
+            log("话题 #\(name)（\(sort == 1 ? "排序1" : "排序0")\(cursor > 0 ? "，续" : "")）：\(r.awemes.count) 条，命中 \(hits)")
         case .related(let id):
             activity = "正在顺藤摸瓜找相似创作者…"
             let list = try await api.related(awemeId: id)
+            learnTopics(list)
             for a in list { pool.add(a.author, source: .related) }
             guard generation == gen else { return }
             let hits = addHits(list.filter { w.contains($0.createTime) }, source: .related)
@@ -620,6 +760,7 @@ final class TimeMachineEngine {
         let cursor = prog.monthCursor?[String(month)] ?? monthYM.endCursorMs
         activity = "正在翻阅 @\(c.nickname) 在 \(monthYM) 前后的作品…"
         let page = try await api.userPosts(secUid: c.secUid, maxCursor: cursor)
+        learnTopics(page.awemes)
 
         // 创作者本身的信息与时间段无关，任何时候都可以更新
         let years = CreatorPool.years(from: page.timeList)
@@ -709,12 +850,20 @@ final class TimeMachineEngine {
     @discardableResult
     private func addHits(_ list: [Aweme], source: CreatorSource?, keyword: String? = nil, viaScan: Bool = false) -> Int {
         var added = 0
-        let ranked = list.filter(\.isPlayable).sorted { Self.heat($0) > Self.heat($1) }
+        // 按热度加权随机排序（Gumbel 技巧）：热的更容易被选上，但不总是同几条
+        let ranked = list.filter(\.isPlayable)
+            .map { a -> (Aweme, Double) in
+                let g = -log(-log(Double.random(in: 0.0001..<0.9999)))
+                return (a, Self.heat(a) * 1.5 + g)
+            }
+            .sorted { $0.1 > $1.1 }
+            .map(\.0)
         var perBatch: [String: Int] = [:]
         for a in ranked {
             let sec = a.author.secUid
             guard !knownIDs.contains(a.id), !mutedAuthors.contains(sec) else { continue }
             if hideSeen && seen.contains(a.id) { continue }
+            if recentVideos[a.id] != nil { continue }   // 最近 7 天已经展示过
             if followOnly && pool.creators[sec]?.followed != true { continue }
             if perBatch[sec, default: 0] >= 2 || authorFound[sec, default: 0] >= 3 { continue }
             knownIDs.insert(a.id)
@@ -731,29 +880,158 @@ final class TimeMachineEngine {
             default: break
             }
             if source != .following && pool.creators[sec]?.followed == true { bonus += 0.04 }
-            candidates.append(Candidate(aweme: a, heat: h, sourceBonus: bonus, jitter: Double.random(in: 0...0.12),
-                                        source: source, keyword: keyword, viaScan: viaScan))
+            let creator = pool.creators[sec]
+            let institution = a.author.isInstitution ?? creator?.isInstitution ?? false
+            let followers = a.author.followerCount ?? creator?.followerCount
+            // 普通人：非机构、粉丝不过百万、互动适中；新闻时政类不算
+            let newsLike = a.primaryCategory.map { $0.contains("时政") || $0.contains("新闻") } ?? false
+            let amateur = !institution && !newsLike && (followers.map { $0 < 1_000_000 } ?? true) && h >= 2.0 && h <= 5.3
+            candidates.append(Candidate(aweme: a, heat: h, sourceBonus: bonus, jitter: Double.random(in: 0...0.45),
+                                        source: source, keyword: keyword, viaScan: viaScan, curatedEra: curatedEraTerm(a),
+                                        amateur: amateur))
             let pos = heatSamples.firstIndex(where: { $0 >= h }) ?? heatSamples.count
             heatSamples.insert(h, at: pos)
             monthCount[a.monthIndex, default: 0] += 1
             added += 1
+            // 话题滚雪球：统计命中视频里的话题，越火的视频权重越高
+            let w = 0.5 + hotPercentile(h)
+            for tag in a.hashtags.prefix(6) where !EraKeywords.genericTags.contains(tag) && tag.count <= 16 {
+                // 话题就是作者名字（如 #某某某）的不算时代话题
+                if tag.contains(a.author.nickname) || a.author.nickname.contains(tag) { continue }
+                topicCounts[tag, default: 0] += 1
+                topicWeights[tag, default: 0] += w
+                topicAuthors[tag, default: []].insert(sec)
+                if let id = a.hashtagIDs?[tag] { topicIDs[tag] = id }
+            }
         }
+        if added > 0 { refreshTopicFrontier() }
         return added
+    }
+
+    /// 把当前最热的几个话题加入搜索 / 话题页队列（只在登录后有效）
+    private func refreshTopicFrontier() {
+        guard account != nil else { return }
+        // 至少 3 位不同作者都在用的话题，才算得上“当时的热门话题”
+        let top = topicWeights
+            .filter { (topicCounts[$0.key] ?? 0) >= 3 && (topicAuthors[$0.key]?.count ?? 0) >= 3 }
+            .sorted { $0.value > $1.value }
+            .prefix(4)
+        for (tag, _) in top {
+            if let id = topicIDs[tag] ?? topicDirectory[tag], !exploredTopics.contains(tag) {
+                exploredTopics.insert(tag)
+                topicQueue.append((name: tag, id: id, cursor: 0, sort: 1))
+            } else if !searchedKeywords.contains(tag) && !searchQueue.contains(where: { $0.kw == tag }) {
+                searchQueue.insert((kw: tag, offset: 0), at: min(1, searchQueue.count))
+            }
+        }
+    }
+
+    /// 从任意一批视频里收集“话题名 → ID”，并把本时间段挂起的热点话题加入话题页队列
+    private func learnTopics(_ list: [Aweme]) {
+        var learned = false
+        for a in list {
+            for (name, id) in a.hashtagIDs ?? [:] where topicDirectory[name] == nil {
+                topicDirectory[name] = id
+                if pendingEraTopics.contains(name) { learned = true }
+            }
+        }
+        if topicDirectory.count > 30000 {
+            for k in topicDirectory.keys.shuffled().prefix(5000) { topicDirectory[k] = nil }
+        }
+        if learned { queueEraTopics() }
+    }
+
+    /// 本时间段的热点词里，已经知道话题 ID 的直接排进话题页队列（两种排序各翻一页）
+    private func queueEraTopics() {
+        guard account != nil else { return }
+        for term in pendingEraTopics {
+            guard let id = topicDirectory[term], !exploredTopics.contains(term) else { continue }
+            exploredTopics.insert(term)
+            pendingEraTopics.remove(term)
+            let first = Bool.random() ? 1 : 0
+            topicQueue.insert((name: term, id: id, cursor: 0, sort: first), at: Int.random(in: 0...min(2, topicQueue.count)))
+            topicQueue.append((name: term, id: id, cursor: 0, sort: 1 - first))
+        }
+    }
+
+    /// 只看时间线（不含滚雪球）的热点命中
+    private func curatedEraTerm(_ a: Aweme) -> String? {
+        let idx = a.monthIndex
+        let terms: [String]
+        if let cached = eraTermCache[idx] {
+            terms = cached
+        } else {
+            terms = EraKeywords.terms(forMonth: idx)
+            eraTermCache[idx] = terms
+        }
+        let text = a.desc + " " + a.hashtags.joined(separator: " ")
+        return terms.first { !EraKeywords.weakTerms.contains($0) && EraKeywords.matches($0, in: text) }
+    }
+
+    /// 候选池里热点内容的占比
+    private var eraShare: Double {
+        guard !candidates.isEmpty else { return 0 }
+        return Double(candidates.filter { $0.curatedEra != nil }.count) / Double(candidates.count)
+    }
+
+    /// 时代感：标题 / 话题命中当月热点 → 1；命中本次航程滚雪球出来的热门话题 → 按热度 0~0.8
+    private func eraMatch(_ a: Aweme) -> (score: Double, term: String?) {
+        let idx = a.monthIndex
+        let terms: [String]
+        if let cached = eraTermCache[idx] {
+            terms = cached
+        } else {
+            terms = EraKeywords.terms(forMonth: idx)
+            eraTermCache[idx] = terms
+        }
+        let text = a.desc + " " + a.hashtags.joined(separator: " ")
+        var weak: String?
+        for t in terms where EraKeywords.matches(t, in: text) {
+            if EraKeywords.weakTerms.contains(t) { weak = weak ?? t } else { return (1.0, t) }
+        }
+        if let weak { return (0.5, weak) }
+        guard let maxW = topicWeights.values.max(), maxW > 0 else { return (0, nil) }
+        var best: (Double, String)?
+        for tag in a.hashtags where (topicCounts[tag] ?? 0) >= 3 {
+            let v = (topicWeights[tag] ?? 0) / maxW
+            if v > (best?.0 ?? 0) { best = (v, tag) }
+        }
+        if let best { return (best.0 * 0.8, "#\(best.1)") }
+        return (0, nil)
     }
 
     private struct ScoreParts {
         var total: Double
         var hot: Double
+        var absolute: Double
         var pref: Double
         var novel: Bool
+        var era: Double
+        var eraTerm: String?
     }
 
     /// 即时打分 = 热度百分位（主）+ 偏好（辅，可调）+ 新鲜分类加分 + 打散惩罚
     private func liveScore(_ c: Candidate) -> ScoreParts {
         let a = c.aweme
-        let hot = hotPercentile(c.heat)
+        // 热度 = 一半看「在本次候选里的排名」，一半看「绝对互动量」（1 千 → 0，100 万 → 1），让真正的全网爆款排前面
+        let absolute = min(1, max(0, (c.heat - 3) / 3))
+        let hot = 0.5 * hotPercentile(c.heat) + 0.5 * absolute
         let pref = max(-1, min(1, interest.score(a) / 3))
-        var s = hot + prefWeight * pref + c.sourceBonus + c.jitter
+        let era = eraMatch(a)
+        // 时代感加分随“最近 3 条里已有几条时代热点”递减：热点占大头，但给当时的其他热门留位置
+        let recentEra = items.suffix(3).filter { itemEraTerm[$0.id] != nil }.count
+        let eraWeight = 0.5 * (1 - 0.3 * Double(recentEra))
+        var s = hot + eraWeight * era.score + prefWeight * pref + c.sourceBonus + c.jitter
+        // 热点不刷屏：
+        // - 主题饱和：最近 10 条里同主题（如“疫情”）越多，扣得越多；
+        // - 单个热点限量：同一个热点词（如“狂飙”）本次航程每出现一次，后面同类再降一档
+        if let term = era.term {
+            let theme = EraKeywords.theme(of: term)
+            let recentThemes = items.suffix(10).compactMap { itemEraTerm[$0.id].map(EraKeywords.theme(of:)) }
+            s -= Double(recentThemes.filter { $0 == theme }.count) * 0.2
+            let plain = term.hasPrefix("#") ? String(term.dropFirst()) : term
+            s -= Double(itemEraTerm.values.filter { ($0.hasPrefix("#") ? String($0.dropFirst()) : $0) == plain }.count) * 0.35
+        }
 
         // 新鲜度：最近 10 条里没出现过的内容大类加分，鼓励多元
         var novel = false
@@ -772,6 +1050,11 @@ final class TimeMachineEngine {
             let lastTwo = items.suffix(2).map(\.id)
             if lastTwo.count == 2 && lastTwo.allSatisfy({ prefDrivenIDs.contains($0) }) { s -= 0.4 }
         }
+        // 跨会话新鲜度：最近几天出现过的作者降权（1 天内最多，7 天后恢复）
+        if let last = recentAuthors[a.author.secUid] {
+            let days = Date().timeIntervalSince(last) / 86400
+            s -= max(0, 0.7 - 0.1 * days)
+        }
         // 明确讨厌的作者无论滑块怎么调都压下去
         if (interest.authors[a.author.secUid] ?? 0) <= -3 { s -= 1 }
         s -= Double(authorCount[a.author.secUid, default: 0]) * 0.5
@@ -779,12 +1062,22 @@ final class TimeMachineEngine {
             let m = a.monthIndex
             s -= Double(items.suffix(4).filter { $0.monthIndex == m }.count) * 0.15
         }
-        return ScoreParts(total: s, hot: hot, pref: pref, novel: novel)
+        return ScoreParts(total: s, hot: hot, absolute: absolute, pref: pref, novel: novel, era: era.score, eraTerm: era.term)
     }
 
-    private func reason(for c: Candidate, _ parts: ScoreParts) -> String {
+    private func reason(for c: Candidate, _ parts: ScoreParts, slot: Slot?) -> String {
         let a = c.aweme
         let followed = c.source == .following || pool.creators[a.author.secUid]?.followed == true
+        if slot == .amateur, parts.era >= 0.6, let term = parts.eraTerm {
+            return "当时的日常：\(term.hasPrefix("#") ? String(term.dropFirst()) : term)"
+        }
+        if parts.era >= 0.6, let term = parts.eraTerm { return "当时的热点：\(term)" }
+        if slot == .amateur {
+            let cat = a.cats.dropFirst().first ?? a.primaryCategory
+            if followed { return "你关注的人" }
+            if parts.pref > 0.2 { return "可能感兴趣 · \(cat ?? "日常")" }
+            return "当时的日常\(cat.map { " · \($0)" } ?? "")"
+        }
         if parts.hot >= 0.8 { return "当时的热门 · \(Fmt.count(a.diggCount))赞\(followed ? " · 你关注的" : "")" }
         if followed { return "你关注的人" }
         // 主要靠偏好入队
@@ -813,7 +1106,45 @@ final class TimeMachineEngine {
         }
     }
 
-    /// 把候选挪进播放队列（只提前排 aheadTarget 条），严格打散作者：
+    /// 推荐页配比：有时代热点时 热点 35% / 热门 30% / 普通人 35%，否则 热门 45% / 普通人 55%
+    private func slotTargets() -> [Slot: Double] {
+        let hasEra = !itemEraTerm.isEmpty || candidates.contains { $0.curatedEra != nil }
+        return hasEra ? [.era: 0.35, .hot: 0.30, .amateur: 0.35] : [.hot: 0.45, .amateur: 0.55]
+    }
+
+    /// 按“最近 12 条里哪类最欠缺”排出这一条优先放哪一类
+    private func slotOrder() -> [Slot] {
+        let targets = slotTargets()
+        let recent = items.suffix(12).compactMap { itemSlot[$0.id] }
+        let n = Double(max(1, recent.count))
+        let deficit = targets.mapValues { _ in 0.0 }.keys.map { slot -> (Slot, Double) in
+            (slot, targets[slot]! - Double(recent.filter { $0 == slot }.count) / n + Double.random(in: 0...0.2))
+        }
+        return deficit.sorted { $0.1 > $1.1 }.map(\.0)
+    }
+
+    private func fits(_ c: Candidate, _ parts: ScoreParts, _ slot: Slot) -> Bool {
+        switch slot {
+        case .era: return parts.era >= 0.6
+        case .hot: return parts.era < 0.6 && parts.absolute >= 0.45
+        case .amateur: return c.amateur
+        }
+    }
+
+    /// 各类位置内部的打分侧重：普通人位置更看“你可能感兴趣”，不比谁更火
+    private func slotScore(_ parts: ScoreParts, _ slot: Slot?) -> Double {
+        guard slot == .amateur else { return parts.total }
+        return parts.total + 0.6 * parts.pref - 0.5 * parts.absolute
+    }
+
+    private func inferSlot(_ c: Candidate, _ parts: ScoreParts) -> Slot {
+        if c.amateur && parts.absolute < 0.45 { return .amateur }
+        if parts.era >= 0.6 { return .era }
+        return .hot
+    }
+
+    /// 把候选挪进播放队列（只提前排 aheadTarget 条）：
+    /// - 先按推荐页配比决定这一条放哪一类，再在这一类里挑分数最高的；
     /// - 同一作者 20 条内最多出现一次，一次航程最多 2 条；
     /// - 只有用户马上没得看、且引擎已经找不到新作者时，才逐级放宽（6 条内不重复 → 3 条内不重复）。
     private func promote(force final: Bool) {
@@ -822,37 +1153,80 @@ final class TimeMachineEngine {
             let urgent = aheadCount == 0
             if !urgent && !final && candidates.count < 3 { break }
 
-            func best(spacing: Int, cap: Int) -> (Int, ScoreParts)? {
+            // 同一个热点词最近 10 条里最多 2 次（硬限制）
+            let recentTerms = items.suffix(10).compactMap { itemEraTerm[$0.id].map { $0.hasPrefix("#") ? String($0.dropFirst()) : $0 } }
+            func termFull(_ parts: ScoreParts) -> Bool {
+                guard parts.era >= 0.6, let t = parts.eraTerm else { return false }
+                let plain = t.hasPrefix("#") ? String(t.dropFirst()) : t
+                return recentTerms.filter { $0 == plain }.count >= 2
+            }
+
+            func best(spacing: Int, cap: Int, slot: Slot?, strict: Bool = true) -> (Int, ScoreParts)? {
                 let recent = Set(items.suffix(spacing).map(\.author.secUid))
                 var bestIdx: Int?
                 var bestParts: ScoreParts?
+                var bestScore = -Double.infinity
                 for (i, c) in candidates.enumerated() {
                     let sec = c.aweme.author.secUid
                     if recent.contains(sec) || authorCount[sec, default: 0] >= cap { continue }
                     let parts = liveScore(c)
-                    if parts.total > (bestParts?.total ?? -Double.infinity) { bestIdx = i; bestParts = parts }
+                    if let slot, !fits(c, parts, slot) { continue }
+                    if strict && termFull(parts) { continue }
+                    let score = slotScore(parts, slot)
+                    if score > bestScore { bestScore = score; bestIdx = i; bestParts = parts }
                 }
                 guard let bestIdx, let bestParts else { return nil }
                 return (bestIdx, bestParts)
             }
 
-            var choice = best(spacing: 20, cap: 2)
-            // 只有在引擎已经找不到新作者时（搜寻结束）才逐级放宽；还在搜寻时宁可让用户等一下
+            var choice: (Int, ScoreParts)?
+            var chosenSlot: Slot?
+            // 热点硬上限：最近 10 条里已有 5 条热点，就先不放热点
+            let recentEra = items.suffix(10).filter { itemSlot[$0.id] == .era }.count
+            for slot in slotOrder() where !(slot == .era && recentEra >= 5) {
+                if let c = best(spacing: 20, cap: 2, slot: slot) { choice = c; chosenSlot = slot; break }
+            }
+            if choice == nil {
+                // 想要的类型暂时没有：引擎还在找、用户也还有得看，就等一等；否则让所有候选统一比分
+                if !urgent && fillTask != nil { break }
+                choice = best(spacing: 20, cap: 2, slot: nil)
+            }
+            // 作者间隔、热点上限都只在引擎已经找不到新内容时（搜寻结束）才逐级放宽；
+            // 还在搜寻时，宁可让用户等一两秒，也不重复同一个人或同一个热点
             let canRelax = urgent && (final || fillTask == nil)
-            if choice == nil && canRelax { choice = best(spacing: 6, cap: 2) }
-            if choice == nil && canRelax { choice = best(spacing: 3, cap: 3) }
+            if choice == nil && canRelax { choice = best(spacing: 20, cap: 2, slot: nil, strict: false) }
+            if choice == nil && canRelax { choice = best(spacing: 6, cap: 2, slot: nil, strict: false) }
+            if choice == nil && canRelax { choice = best(spacing: 3, cap: 3, slot: nil, strict: false) }
             guard let (idx, parts) = choice else { break }
 
             let c = candidates.remove(at: idx)
+            let slot = chosenSlot ?? inferSlot(c, parts)
             var a = c.aweme
-            a.reason = reason(for: c, parts)
+            a.reason = reason(for: c, parts, slot: slot)
             if parts.pref > 0.4 && prefWeight * parts.pref >= parts.hot * 0.5 { prefDrivenIDs.insert(a.id) }
             authorCount[a.author.secUid, default: 0] += 1
+            if let term = parts.eraTerm, parts.era >= 0.6 { itemEraTerm[a.id] = term }
+            itemSlot[a.id] = slot
             items.append(a)
-            log("入队 #\(items.count)：@\(a.author.nickname)（\(Fmt.dayFormatter.string(from: a.date))\(a.primaryCategory.map { " · \($0)" } ?? "")）热度 \(Int(parts.hot * 100))% 偏好 \(String(format: "%+.2f", parts.pref)) · \(a.reason ?? "")")
+            if items.count == 1 { markShown(a) }   // 第一条会立刻展示
+            log("入队 #\(items.count) [\(slot.rawValue)]：@\(a.author.nickname)（\(Fmt.dayFormatter.string(from: a.date))\(a.primaryCategory.map { " · \($0)" } ?? "")）热度 \(Int(parts.hot * 100))% 时代 \(Int(parts.era * 100))% 偏好 \(String(format: "%+.2f", parts.pref)) · \(a.reason ?? "")")
             changed = true
         }
         if changed { onItemsChanged?() }
+    }
+
+    /// 自检用：候选池构成
+    var poolMix: String {
+        let era = candidates.filter { $0.curatedEra != nil }.count
+        let amateur = candidates.filter(\.amateur).count
+        return "候选池 \(candidates.count) 条（热点 \(era)、普通人 \(amateur)）"
+    }
+
+    /// 自检用：已入队视频各类位置的数量
+    var slotMix: [String: Int] {
+        var out: [String: Int] = [:]
+        for a in items { if let s = itemSlot[a.id] { out[s.rawValue, default: 0] += 1 } }
+        return out
     }
 
     private func updateStatus() {
@@ -923,5 +1297,10 @@ final class TimeMachineEngine {
         Store.save(interest, "interest.json")
         Store.save(pool, "creators.json")
         Store.save(seen, "seen.json")
+        Store.save(topicDirectory, "topics.json")
+        if persistFreshness {
+            Store.save(recentAuthors, "recent_authors.json")
+            Store.save(recentVideos, "recent_videos.json")
+        }
     }
 }

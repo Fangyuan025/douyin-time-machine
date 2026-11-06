@@ -6,6 +6,10 @@ struct Author: Codable, Hashable, Identifiable {
     var secUid: String
     var nickname: String
     var avatarURL: URL?
+    /// 粉丝数（接口不一定返回）
+    var followerCount: Int?
+    /// 机构 / 媒体 / 官方认证账号
+    var isInstitution: Bool?
 
     var id: String { secUid.isEmpty ? uid : secUid }
 
@@ -27,6 +31,15 @@ struct Author: Codable, Hashable, Identifiable {
             ?? j["avatar_168x168"].urlList.first
             ?? j["avatar_medium"].urlList.first
             ?? j["avatar_larger"].urlList.first
+        if let f = j["follower_count"].int, f > 0 { self.followerCount = f }
+        let enterprise = j["enterprise_verify_reason"].string ?? ""
+        let custom = j["custom_verify"].string ?? ""
+        let institutionWords = ["官方", "媒体", "机构", "政务", "新闻", "日报", "电视台", "广播", "融媒"]
+        if !enterprise.isEmpty || institutionWords.contains(where: { custom.contains($0) || self.nickname.contains($0) }) {
+            self.isInstitution = true
+        } else if !custom.isEmpty || j["follower_count"].exists {
+            self.isInstitution = false
+        }
     }
 }
 
@@ -56,6 +69,8 @@ struct Aweme: Codable, Hashable, Identifiable {
     var categories: [String]?
     /// 推荐理由（由推荐引擎在入队时填写）
     var reason: String?
+    /// 话题名 → 话题 ID（用于翻话题页）
+    var hashtagIDs: [String: String]?
 
     var cats: [String] { categories ?? [] }
     var primaryCategory: String? { categories?.first }
@@ -133,6 +148,11 @@ struct Aweme: Codable, Hashable, Identifiable {
 
         let extras = j["text_extra"].array
         self.hashtags = extras.compactMap { $0["hashtag_name"].string }.filter { !$0.isEmpty }
+        var ids: [String: String] = [:]
+        for te in extras {
+            if let n = te["hashtag_name"].string, !n.isEmpty, let id = te["hashtag_id"].string, !id.isEmpty, id != "0" { ids[n] = id }
+        }
+        self.hashtagIDs = ids.isEmpty ? nil : ids
         let ns = (j["desc"].string ?? "") as NSString
         self.mentions = extras.compactMap { te -> Author? in
             guard let sec = te["sec_uid"].string, !sec.isEmpty, sec != author.secUid else { return nil }
