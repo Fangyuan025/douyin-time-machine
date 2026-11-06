@@ -75,6 +75,13 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
     @ObservationIgnored private var waiters: [CheckedContinuation<Void, Error>] = []
     @ObservationIgnored private var lastSend = Date.distantPast
     @ObservationIgnored private var currentGap: TimeInterval = 0
+    /// 敏感接口（搜索、评论回复）单独限速：它们最容易触发人机验证
+    @ObservationIgnored private var lastSensitiveSend = Date.distantPast
+    @ObservationIgnored private static let sensitivePaths: Set<String> = [
+        "/aweme/v1/web/search/item/", "/aweme/v1/web/general/search/single/", "/aweme/v1/web/comment/list/reply/",
+    ]
+    /// 出现超时 / 异常返回后，自动放慢一段时间
+    @ObservationIgnored private var slowUntil = Date.distantPast
     @ObservationIgnored private var loadGeneration = 0
 
     override init() {
@@ -300,16 +307,32 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     /// 节流：只有真正发出请求时才占用时间槽；已取消的任务（比如切换了时间段）立即退出排队，
     /// 不会让新请求排在一堆作废请求后面。
-    private func pace() async throws {
+    /// 普通接口按 minInterval；敏感接口额外保证彼此间隔至少 1.5 秒；出过异常的 2 分钟内整体放慢。
+    private func pace(sensitive: Bool) async throws {
         while true {
             try Task.checkCancellation()
-            let wait = lastSend.addingTimeInterval(currentGap).timeIntervalSinceNow
+            var wait = lastSend.addingTimeInterval(currentGap).timeIntervalSinceNow
+            if sensitive {
+                wait = max(wait, lastSensitiveSend.addingTimeInterval(max(1.5, minInterval * 3)).timeIntervalSinceNow)
+            }
             if wait <= 0 {
                 lastSend = Date()
-                currentGap = minInterval + Double.random(in: 0...(minInterval * 0.6))
+                if sensitive { lastSensitiveSend = lastSend }
+                let factor = Date() < slowUntil ? 2.5 : 1
+                currentGap = (minInterval + Double.random(in: 0...(minInterval * 0.5))) * factor
                 return
             }
             try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+        }
+    }
+
+    private func noteTrouble(_ e: DouyinError) {
+        switch e {
+        case .timeout, .empty, .http:
+            if Date() >= slowUntil { logWarn("请求出现异常，接下来 2 分钟放慢请求节奏") }
+            slowUntil = Date().addingTimeInterval(120)
+        default:
+            break
         }
     }
 
@@ -325,7 +348,7 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
         var lastError: Error = DouyinError.notReady
         for attempt in 0..<2 {
             try await ensureReady()
-            try await pace()
+            try await pace(sensitive: Self.sensitivePaths.contains(path))
             if state != .ready { try await ensureReady() }
             requestCount += 1
             do {
@@ -345,6 +368,7 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
             } catch is CancellationError {
                 throw CancellationError()
             } catch let e as DouyinError {
+                noteTrouble(e)
                 switch e {
                 case .timeout(let why) where why == "脚本无响应":
                     // 原生侧超时：多半是页面刷新导致脚本上下文丢失，等页面重新就绪后再试

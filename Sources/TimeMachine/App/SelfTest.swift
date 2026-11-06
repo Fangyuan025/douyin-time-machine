@@ -164,14 +164,45 @@ enum SelfTest {
                 let pandemicWords = ["武汉", "疫情", "口罩", "抗疫", "隔离", "宅家", "火神山", "雷神山", "钟南山", "复工", "肺炎",
                                      "防疫", "医护", "白衣", "病毒", "在家", "中国加油", "加油中国", "云监工", "居家", "抗击", "逆行",
                                      "核酸", "大白", "团购", "方舱", "抗原", "健康码", "封控", "静默", "物资", "志愿者", "上海加油", "解封"]
+                // 速度：热点少的普通时间段（2018 全年）只能靠扫描创作者，最能体现找视频的速度
+                do {
+                    let w2018 = TimeWindow(from: YearMonth(year: 2018, month: 1), to: YearMonth(year: 2018, month: 12))
+                    engine.travel(to: w2018)
+                    let t0 = Date()
+                    var tFirst: Double?
+                    while tFirst == nil && Date().timeIntervalSince(t0) < 60 {
+                        try? await Task.sleep(nanoseconds: 250_000_000)
+                        if !engine.items.isEmpty { tFirst = Date().timeIntervalSince(t0) }
+                    }
+                    var n = 0, stalls = 0, t = 0
+                    while n < 12 && t < 90 {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        t += 1
+                        if engine.aheadCount > 0 { engine.move(by: 1); n += 1 } else { stalls += 1 }
+                    }
+                    let fast = (tFirst ?? 99) < 8 && stalls <= 3
+                    if !fast { ok = false }
+                    print("\(fast ? "✅" : "❌") ⏱ 速度（2018 全年）：第一条 \(tFirst.map { String(format: "%.1f", $0) } ?? "超时") 秒；每 2 秒划一条，刷 \(n) 条时等待了 \(stalls) 次；请求 \(engine.stats.requests) 次")
+                }
+
                 for ym in [YearMonth(year: 2020, month: 2), YearMonth(year: 2022, month: 4)] {
                     engine.travel(to: .single(ym))
-                    var n = 0, t = 0
+                    // 计时：出发 → 第一条视频、→ 找到 6 条
+                    let t0 = Date()
+                    var tFirst: Double?, tSix: Double?
+                    while (tFirst == nil || tSix == nil) && Date().timeIntervalSince(t0) < 90 {
+                        try? await Task.sleep(nanoseconds: 250_000_000)
+                        if tFirst == nil && !engine.items.isEmpty { tFirst = Date().timeIntervalSince(t0) }
+                        if tSix == nil && engine.stats.hits >= 6 { tSix = Date().timeIntervalSince(t0) }
+                    }
+                    print("⏱ 速度（\(ym)）：第一条 \(tFirst.map { String(format: "%.1f", $0) } ?? "超时") 秒，找到 6 条 \(tSix.map { String(format: "%.1f", $0) } ?? "超时") 秒，请求 \(engine.stats.requests) 次")
+                    var n = 0, t = 0, stalls = 0
                     while n < 12 && t < 160 {
                         try? await Task.sleep(nanoseconds: 2_000_000_000)
                         t += 1
-                        if engine.aheadCount > 0 { engine.move(by: 1); n += 1 }
+                        if engine.aheadCount > 0 { engine.move(by: 1); n += 1 } else { stalls += 1 }
                     }
+                    print("   刷 \(n) 条时等待了 \(stalls) 次")
                     let shown = Array(engine.items.prefix(engine.currentIndex + 1))
                     if let dump = ProcessInfo.processInfo.environment["TM_SELFTEST_DUMP"] {
                         let line = "\(ym.short)\t" + shown.map(\.author.secUid).joined(separator: ",") + "\t" + shown.map(\.id).joined(separator: ",") + "\n"

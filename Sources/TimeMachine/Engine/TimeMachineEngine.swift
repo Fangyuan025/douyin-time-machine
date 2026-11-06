@@ -180,7 +180,7 @@ final class TimeMachineEngine {
     @ObservationIgnored private var followMaxTime = 0
     @ObservationIgnored private var likesCursor = 0
 
-    private let workerCount = 2
+    private let workerCount = 3
     private static let useSearch = false
     /// 提前排进播放队列的条数（其余留在候选池里，切换时按最新兴趣重排）
     private let aheadTarget = 3
@@ -527,6 +527,15 @@ final class TimeMachineEngine {
         }
 
         let r = Double.random(in: 0..<1)
+        // 开局提速：前几次扫描优先挑“已知在这个时间段发过作品”的创作者，几乎一扫一个准。
+        // 但热点话题页先翻两页（时代感的主要来源），两者由不同的并发请求同时进行
+        let topicsFirst = !window.touchesRecent && topicsThisWindow < 2 && !topicQueue.isEmpty
+        if !topicsFirst && stats.creatorsScanned < 6 && r < 0.8 {
+            let range = window.monthIndices
+            let known = eligible.filter { c in c.activeMonths?.contains(where: { range.contains($0) }) ?? false }
+            let fresh = known.filter { recentAuthors[$0.secUid] == nil }
+            if let pick = (fresh.isEmpty ? known : fresh).randomElement() { return .creator(pick) }
+        }
         // 搜索与话题页是找“当时大家在看什么”最有效的途径；搜索最容易触发安全验证，所以限频：
         // 每个时间段最多 12 次，两次之间至少隔 8 秒
         // 后台不再使用搜索：抖音搜索极易触发人机验证，而且会在后台页面里留下待完成的验证码，
