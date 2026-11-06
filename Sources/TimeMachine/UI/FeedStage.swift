@@ -572,7 +572,7 @@ private struct SearchingView: View {
                         Button("切换到全站探索") { e.setFollowOnly(false) }
                     }
                     if case .error = e.phase {
-                        Button("打开抖音网页验证") { openWindow(id: "login") }
+                        Button("打开抖音网页看看") { openWindow(id: "login") }
                     }
                 }
                 .buttonStyle(SubtleButtonStyle())

@@ -62,6 +62,11 @@ enum SelfTest {
                     let ds = page.awemes.prefix(5).map { Fmt.dayFormatter.string(from: $0.date) }
                     return "\(page.awemes.count) 条 hasMore=\(page.hasMore) timeList=\(page.timeList.prefix(6)) \(ds)"
                 } }
+                if CommandLine.arguments.contains("--quick") {
+                    print(ok ? "QUICK PASS" : "QUICK FAIL")
+                    fflush(stdout)
+                    exit(0)
+                }
                 await check("播放地址可访问") {
                     guard let url = a.playURLs.first else { return "无地址" }
                     var req = URLRequest(url: url)

@@ -165,6 +165,13 @@ final class TimeMachineEngine {
     /// 出错后的退避截止时间
     @ObservationIgnored private var backoffUntil = Date.distantPast
     @ObservationIgnored private var lastSearchAt = Date.distantPast
+    /// 作品列表接口被抖音限流时的冷却截止时间（跨重启保存）；冷却期间改用话题页 / 推荐流继续找
+    @ObservationIgnored private var postsCooldownUntil: Date = {
+        let t = UserDefaults.standard.double(forKey: "postsCooldownUntil")
+        return t > 0 ? Date(timeIntervalSince1970: t) : .distantPast
+    }()
+    @ObservationIgnored private var postsLimitStrikes = 0
+    var postsCoolingSeconds: Int { max(0, Int(postsCooldownUntil.timeIntervalSinceNow.rounded(.up))) }
     @ObservationIgnored private var budget = 0
     @ObservationIgnored private var inflight = 0
     @ObservationIgnored private var inflightCreators = Set<String>()
@@ -448,6 +455,7 @@ final class TimeMachineEngine {
             }
             if case .wait = action {
                 try? await Task.sleep(nanoseconds: 500_000_000)
+                updateStatus()   // 冷却倒计时
                 continue
             }
             idleSpins = 0
@@ -457,6 +465,7 @@ final class TimeMachineEngine {
             do {
                 try await perform(action, gen)
                 if generation == gen { errorsInRow = 0 }
+                if case .creator = action { postsLimitStrikes = 0 }
             } catch is CancellationError {
                 // 切换了时间段，忽略
             } catch {
@@ -471,6 +480,16 @@ final class TimeMachineEngine {
 
     private func handle(_ error: Error, _ action: Action) {
         let e = error as? DouyinError
+        // 作品列表接口被限流（404 / 空内容 / 403 / 429）：不算致命错误，冷却后自动恢复
+        if case .creator = action, account != nil, Self.isRateLimit(e) {
+            postsLimitStrikes += 1
+            let seconds = min(600, 30 * pow(2, Double(postsLimitStrikes - 1)))
+            postsCooldownUntil = Date().addingTimeInterval(seconds)
+            UserDefaults.standard.set(postsCooldownUntil.timeIntervalSince1970, forKey: "postsCooldownUntil")
+            logWarn("抖音暂时限制了读取创作者作品，\(Int(seconds)) 秒内改用话题页和推荐流继续找")
+            updateStatus()
+            return
+        }
         switch action {
         case .creator(let c):
             var p = pool.progress(window, c.secUid) ?? WindowProgress()
@@ -503,6 +522,14 @@ final class TimeMachineEngine {
         }
     }
 
+    private static func isRateLimit(_ e: DouyinError?) -> Bool {
+        switch e {
+        case .http(let code, _)?: return code == 404 || code == 403 || code == 429
+        case .empty?: return true
+        default: return false
+        }
+    }
+
     // MARK: - 行动选择
 
     private func nextAction() -> Action? {
@@ -517,13 +544,14 @@ final class TimeMachineEngine {
             if !likesDone { return .seedLikes }
         }
 
-        var eligible = pool.eligible(for: window).filter {
+        let postsCooling = Date() < postsCooldownUntil
+        var eligible = postsCooling ? [] : pool.eligible(for: window).filter {
             !inflightCreators.contains($0.secUid) && !mutedAuthors.contains($0.secUid)
         }
         if followOnly {
             eligible = eligible.filter(\.followed)
             if !eligible.isEmpty { return .creator(pickCreator(eligible, amateur: false)) }
-            return (seedBusy || inflight > 0) ? .wait : nil
+            return (seedBusy || inflight > 0 || postsCooling) ? .wait : nil
         }
 
         let r = Double.random(in: 0..<1)
@@ -549,7 +577,7 @@ final class TimeMachineEngine {
         if !eligible.isEmpty && candidates.count >= 4 && amateurShare < 0.3 && r < 0.6 {
             return .creator(pickCreator(eligible, amateur: true))
         }
-        let canTopic = !topicQueue.isEmpty && topicsThisWindow < 20 && (!eraHeavy || topicsThisWindow < 2)
+        let canTopic = !topicQueue.isEmpty && topicsThisWindow < (postsCooling ? 40 : 20) && (!eraHeavy || topicsThisWindow < 2 || postsCooling)
         // 较早的时间段：话题页是找“当时大家在看什么”最稳的入口（搜索很容易被风控挂住）
         if canTopic && !window.touchesRecent && (topicsThisWindow < 4 || r < 0.5) { return nextTopic() }
         // 还没有可翻的热点话题时，先试一次搜索：搜索结果里会带出这些话题的 ID
@@ -558,8 +586,11 @@ final class TimeMachineEngine {
         if !relatedQueue.isEmpty && r >= 0.3 && r < 0.37 { return .related(relatedQueue.removeFirst()) }
         let searchChance = window.touchesRecent ? 0.08 : 0.35
         if canSearch && r >= 0.37 && r < 0.37 + searchChance { return nextSearch() }
+        // 推荐流里几乎都是最近的视频：只有最近半年的时间段才值得多刷；较早的时间段最多刷 4 页用来扩充创作者池，
+        // 作品列表接口冷却期间则完全不刷（刷了也命中不了，只会白白增加请求量）
+        let maxFeed = window.touchesRecent ? (postsCooling ? 60 : 30) : (postsCooling ? 0 : 4)
         let wantFeed = eligible.count < 15 || (window.touchesRecent && r > 0.6) || r > 0.96
-        if wantFeed && feedPagesThisWindow < 30 { return .feed }
+        if wantFeed && feedPagesThisWindow < maxFeed { return .feed }
         if !eligible.isEmpty {
             // 候选池里普通人的日常内容不足三成时，多去找普通创作者
             let wantAmateur = amateurShare < 0.3 && Double.random(in: 0..<1) < 0.65
@@ -568,8 +599,8 @@ final class TimeMachineEngine {
         if canSearch { return nextSearch() }
         if canTopic { return nextTopic() }
         if !relatedQueue.isEmpty { return .related(relatedQueue.removeFirst()) }
-        if feedPagesThisWindow < 30 { return .feed }
-        if seedBusy || inflight > 0 || (Self.useSearch && !searchQueue.isEmpty && !searchDisabled && searchesThisWindow < 12) { return .wait }
+        if feedPagesThisWindow < maxFeed { return .feed }
+        if seedBusy || inflight > 0 || postsCooling || (Self.useSearch && !searchQueue.isEmpty && !searchDisabled && searchesThisWindow < 12) { return .wait }
         return nil
     }
 
@@ -1248,6 +1279,8 @@ final class TimeMachineEngine {
 
     private func updateStatus() {
         switch phase {
+        case .searching where postsCoolingSeconds > 0 && !postsBlocked:
+            statusText = "抖音暂时限制了读取创作者作品，正在用话题页继续找（\(postsCoolingSeconds) 秒后恢复）"
         case .searching:
             if postsBlocked {
                 statusText = "未登录 · 正在推荐流里筛选 \(window) 的视频（已翻 \(stats.feedPages) 页）"
