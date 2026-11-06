@@ -84,6 +84,9 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
     @ObservationIgnored private var slowUntil = Date.distantPast
     /// 作品列表接口调用最频繁、也最容易被限流：单独保证彼此间隔
     @ObservationIgnored private var lastPostSend = Date.distantPast
+    /// 作品列表接口最近一小时的调用时间（每小时最多 360 次，避免再次触发风控）
+    @ObservationIgnored private var postSends: [Date] = []
+    @ObservationIgnored private static let postHourlyLimit = 360
     @ObservationIgnored private static let postPath = "/aweme/v1/web/aweme/post/"
     @ObservationIgnored private var loadGeneration = 0
 
@@ -319,7 +322,7 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
                 wait = max(wait, lastSensitiveSend.addingTimeInterval(max(1.5, minInterval * 3)).timeIntervalSinceNow)
             }
             if posts {
-                wait = max(wait, lastPostSend.addingTimeInterval(max(1.2, minInterval * 3) + Double.random(in: 0...0.4)).timeIntervalSinceNow)
+                wait = max(wait, lastPostSend.addingTimeInterval(max(0.9, minInterval * 2) + Double.random(in: 0...0.3)).timeIntervalSinceNow)
             }
             if wait <= 0 {
                 lastSend = Date()
@@ -357,7 +360,16 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
         var lastError: Error = DouyinError.notReady
         for attempt in 0..<2 {
             try await ensureReady()
+            if path == Self.postPath {
+                let hourAgo = Date().addingTimeInterval(-3600)
+                postSends.removeAll { $0 < hourAgo }
+                if postSends.count >= Self.postHourlyLimit {
+                    // 不发请求，按限流处理（引擎会进入冷却，期间改用话题页）
+                    throw DouyinError.http(429, path)
+                }
+            }
             try await pace(sensitive: Self.sensitivePaths.contains(path), posts: path == Self.postPath)
+            if path == Self.postPath { postSends.append(Date()) }
             if state != .ready { try await ensureReady() }
             requestCount += 1
             do {

@@ -28,7 +28,7 @@ final class DouyinAPI {
 
     // MARK: 用户作品（时光机核心：max_cursor 是毫秒时间戳，可以直接跳到任意时间点往前翻）
 
-    func userPosts(secUid: String, maxCursor: Int, count: Int = 25) async throws -> PostPage {
+    func userPosts(secUid: String, maxCursor: Int, count: Int = 18) async throws -> PostPage {
         let j = try await bridge.get("/aweme/v1/web/aweme/post/", [
             "sec_user_id": secUid,
             "max_cursor": String(maxCursor),

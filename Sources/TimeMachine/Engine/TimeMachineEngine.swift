@@ -33,6 +33,7 @@ final class TimeMachineEngine {
     struct Stats {
         var requests = 0
         var creatorsScanned = 0
+        var scansWithHits = 0
         var hits = 0
         var feedPages = 0
     }
@@ -170,7 +171,7 @@ final class TimeMachineEngine {
         let t = UserDefaults.standard.double(forKey: "postsCooldownUntil")
         return t > 0 ? Date(timeIntervalSince1970: t) : .distantPast
     }()
-    @ObservationIgnored private var postsLimitStrikes = 0
+    @ObservationIgnored private var postsLimitStrikes = UserDefaults.standard.integer(forKey: "postsLimitStrikes")
     var postsCoolingSeconds: Int { max(0, Int(postsCooldownUntil.timeIntervalSinceNow.rounded(.up))) }
     @ObservationIgnored private var budget = 0
     @ObservationIgnored private var inflight = 0
@@ -189,8 +190,13 @@ final class TimeMachineEngine {
 
     private let workerCount = 3
     private static let useSearch = false
-    /// 提前排进播放队列的条数（其余留在候选池里，切换时按最新兴趣重排）
-    private let aheadTarget = 3
+    /// 提前排进播放队列的条数（其余留在候选池里，切换时按最新兴趣重排）；内容稀少的时间段多攒几条
+    private var aheadTarget: Int { sparseWindow ? 5 : 3 }
+
+    /// 内容稀少的时间段（如 2018 年）：大部分创作者那时还没开始发作品，扫描命中率很低
+    private var sparseWindow: Bool {
+        stats.creatorsScanned >= 8 && Double(stats.scansWithHits) / Double(stats.creatorsScanned) < 0.4
+    }
 
     init(api: DouyinAPI, window: TimeWindow) {
         self.api = api
@@ -416,7 +422,8 @@ final class TimeMachineEngine {
                 if postsBlocked && !window.touchesRecent {
                     phase = .needsLogin
                 } else {
-                    phase = exhaustedFlag ? .exhausted : .waitingMore
+                    // 作品列表冷却中导致的“没东西可找”不算翻完，冷却结束会自动继续
+                    phase = (exhaustedFlag && postsCoolingSeconds == 0) ? .exhausted : .waitingMore
                 }
             } else if aheadCount < 1 && candidates.isEmpty {
                 phase = exhaustedFlag ? .exhausted : .waitingMore
@@ -465,7 +472,10 @@ final class TimeMachineEngine {
             do {
                 try await perform(action, gen)
                 if generation == gen { errorsInRow = 0 }
-                if case .creator = action { postsLimitStrikes = 0 }
+                if case .creator = action, postsLimitStrikes > 0 {
+                    postsLimitStrikes = 0
+                    UserDefaults.standard.set(0, forKey: "postsLimitStrikes")
+                }
             } catch is CancellationError {
                 // 切换了时间段，忽略
             } catch {
@@ -483,10 +493,12 @@ final class TimeMachineEngine {
         // 作品列表接口被限流（404 / 空内容 / 403 / 429）：不算致命错误，冷却后自动恢复
         if case .creator = action, account != nil, Self.isRateLimit(e) {
             postsLimitStrikes += 1
-            let seconds = min(600, 30 * pow(2, Double(postsLimitStrikes - 1)))
+            let seconds = min(1800, 30 * pow(2, Double(postsLimitStrikes - 1)))
             postsCooldownUntil = Date().addingTimeInterval(seconds)
             UserDefaults.standard.set(postsCooldownUntil.timeIntervalSince1970, forKey: "postsCooldownUntil")
-            logWarn("抖音暂时限制了读取创作者作品，\(Int(seconds)) 秒内改用话题页和推荐流继续找")
+            UserDefaults.standard.set(postsLimitStrikes, forKey: "postsLimitStrikes")
+            logWarn("抖音暂时限制了读取创作者作品，\(Int(seconds)) 秒内改用话题页继续找")
+            scheduleResumeAfterCooldown()
             updateStatus()
             return
         }
@@ -519,6 +531,20 @@ final class TimeMachineEngine {
             phase = .error(blocked
                 ? "抖音暂时拒绝了请求，可能触发了安全验证。请打开「抖音网页」完成验证后点「继续寻找」。"
                 : "网络请求连续失败：\(error.localizedDescription)")
+        }
+    }
+
+    /// 冷却结束时，如果引擎因为没东西可找停下了，自动继续
+    private func scheduleResumeAfterCooldown() {
+        let wait = max(1, postsCooldownUntil.timeIntervalSinceNow + 1)
+        let gen = generation
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            guard let self, self.generation == gen else { return }
+            switch self.phase {
+            case .waitingMore, .exhausted: self.continueSearching()
+            default: break
+            }
         }
     }
 
@@ -560,7 +586,10 @@ final class TimeMachineEngine {
         let topicsFirst = !window.touchesRecent && topicsThisWindow < 2 && !topicQueue.isEmpty
         if !topicsFirst && stats.creatorsScanned < 6 && r < 0.8 {
             let range = window.monthIndices
-            let known = eligible.filter { c in c.activeMonths?.contains(where: { range.contains($0) }) ?? false }
+            let endTS = window.endTS
+            let known = eligible.filter { c in
+                (c.activeMonths?.contains(where: { range.contains($0) }) ?? false) || (c.oldestSeenTS.map { $0 < endTS } ?? false)
+            }
             let fresh = known.filter { recentAuthors[$0.secUid] == nil }
             if let pick = (fresh.isEmpty ? known : fresh).randomElement() { return .creator(pick) }
         }
@@ -600,7 +629,8 @@ final class TimeMachineEngine {
         if canTopic { return nextTopic() }
         if !relatedQueue.isEmpty { return .related(relatedQueue.removeFirst()) }
         if feedPagesThisWindow < maxFeed { return .feed }
-        if seedBusy || inflight > 0 || postsCooling || (Self.useSearch && !searchQueue.isEmpty && !searchDisabled && searchesThisWindow < 12) { return .wait }
+        if seedBusy || inflight > 0 || (Self.useSearch && !searchQueue.isEmpty && !searchDisabled && searchesThisWindow < 12) { return .wait }
+        if postsCooling { scheduleResumeAfterCooldown() }
         return nil
     }
 
@@ -610,8 +640,8 @@ final class TimeMachineEngine {
     }
 
     private func nextTopic() -> Action {
-        // 已经翻够 2 页的话题，队列里剩下的同名条目直接跳过
-        while let first = topicQueue.first, (topicPages[first.name] ?? 0) >= 2 { topicQueue.removeFirst() }
+        // 已经翻够的话题，队列里剩下的同名条目直接跳过
+        while let first = topicQueue.first, (topicPages[first.name] ?? 0) >= 5 || (first.cursor == 0 && (topicPages[first.name] ?? 0) >= 2) { topicQueue.removeFirst() }
         guard !topicQueue.isEmpty else { return .wait }
         let t = topicQueue.removeFirst()
         return .topic(name: t.name, id: t.id, cursor: t.cursor, sort: t.sort)
@@ -645,6 +675,10 @@ final class TimeMachineEngine {
             }
             // 探索：池子里还没扫过的人加一点分，避免总是翻那几个“已知高产”的人
             if c.queries == 0 { alpha += 1 }
+            // 见过 TA 在目标时间段结束前的作品：那时候已经在发作品了，扫到的概率高
+            if let oldest = c.oldestSeenTS {
+                if oldest < window.endTS { alpha += 2.5 } else if oldest > window.endTS + 365 * 86400 { beta += 1 }
+            }
             if c.sources.contains(.search) { alpha += 1.5 }   // 年代热梗按点赞搜出来的：当年的热门创作者
             if c.sources.contains(.mention) { alpha += 0.5 }
             if c.followed { alpha += 0.3 }
@@ -725,6 +759,7 @@ final class TimeMachineEngine {
                 pool.add(a.author, source: .feed)
                 for m in a.mentions { pool.add(m, source: .mention) }
             }
+            pool.noteSeen(list)
             guard generation == gen else { return }
             feedPagesThisWindow += 1
             stats.feedPages += 1
@@ -752,11 +787,15 @@ final class TimeMachineEngine {
             let r = try await api.challengeVideos(chId: id, cursor: cursor, sortType: sort)
             learnTopics(r.awemes)
             for a in r.awemes { pool.add(a.author, source: .search) }
+            pool.noteSeen(r.awemes)
             guard generation == gen else { return }
-            let hits = addHits(r.awemes.filter { w.contains($0.createTime) }, source: .search, keyword: "#\(name)")
+            let inWindow = r.awemes.filter { w.contains($0.createTime) }
+            let hits = addHits(inWindow, source: .search, keyword: "#\(name)")
             topicPages[name, default: 0] += 1
-            // 命中多就继续往下翻，但每个话题最多 2 页
-            if hits >= 3 && r.hasMore && r.cursor > cursor && (topicPages[name] ?? 0) < 2 {
+            // 这一页里属于目标时间段的视频多，就继续往下翻：通常最多 2 页；
+            // 如果这些视频你都已经看过（命中被过滤掉了），允许多翻几页去找新的
+            let pageCap = hits == 0 && inWindow.count >= 3 ? 5 : 2
+            if inWindow.count >= 3 && r.hasMore && r.cursor > cursor && (topicPages[name] ?? 0) < pageCap {
                 topicQueue.insert((name: name, id: id, cursor: r.cursor, sort: sort), at: 0)
             }
             log("话题 #\(name)（\(sort == 1 ? "排序1" : "排序0")\(cursor > 0 ? "，续" : "")）：\(r.awemes.count) 条，命中 \(hits)")
@@ -838,6 +877,7 @@ final class TimeMachineEngine {
 
         if prog.pages == 0 { stats.creatorsScanned += 1 }
         prog.pages += 1
+        if !inWindow.isEmpty && prog.pages == 1 { stats.scansWithHits += 1 }
         let hits = addHits(inWindow, source: c.followed ? .following : c.primarySource, viaScan: true)
         for a in inWindow {
             for m in a.mentions { pool.add(m, source: .mention) }
@@ -976,6 +1016,7 @@ final class TimeMachineEngine {
 
     /// 从任意一批视频里收集“话题名 → ID”，并把本时间段挂起的热点话题加入话题页队列
     private func learnTopics(_ list: [Aweme]) {
+        pool.noteSeen(list)
         var learned = false
         for a in list {
             for (name, id) in a.hashtagIDs ?? [:] where topicDirectory[name] == nil {
@@ -1076,7 +1117,7 @@ final class TimeMachineEngine {
         if let term = era.term {
             let theme = EraKeywords.theme(of: term)
             let recentThemes = items.suffix(10).compactMap { itemEraTerm[$0.id].map(EraKeywords.theme(of:)) }
-            s -= Double(recentThemes.filter { $0 == theme }.count) * 0.2
+            s -= Double(max(0, recentThemes.filter { $0 == theme }.count - 3)) * 0.25
             let plain = term.hasPrefix("#") ? String(term.dropFirst()) : term
             s -= Double(itemEraTerm.values.filter { ($0.hasPrefix("#") ? String($0.dropFirst()) : $0) == plain }.count) * 0.35
         }
@@ -1231,13 +1272,15 @@ final class TimeMachineEngine {
             var chosenSlot: Slot?
             // 热点硬上限：最近 10 条里已有 5 条热点，就先不放热点
             let recentEra = items.suffix(10).filter { itemSlot[$0.id] == .era }.count
+            // 同一作者的间隔：平时 20 条；内容稀少的时间段放宽到 6 条（否则一半候选都要排队等，供给减半）
+            let spacing = sparseWindow ? 6 : 20
             for slot in slotOrder() where !(slot == .era && recentEra >= 5) {
-                if let c = best(spacing: 20, cap: 2, slot: slot) { choice = c; chosenSlot = slot; break }
+                if let c = best(spacing: spacing, cap: 2, slot: slot) { choice = c; chosenSlot = slot; break }
             }
             if choice == nil {
                 // 想要的类型暂时没有：引擎还在找、用户也还有得看，就等一等；否则让所有候选统一比分
                 if !urgent && fillTask != nil { break }
-                choice = best(spacing: 20, cap: 2, slot: nil)
+                choice = best(spacing: spacing, cap: 2, slot: nil)
             }
             // 作者间隔、热点上限都只在引擎已经找不到新内容时（搜寻结束）才逐级放宽；
             // 还在搜寻时，宁可让用户等一两秒，也不重复同一个人或同一个热点
@@ -1280,7 +1323,7 @@ final class TimeMachineEngine {
     private func updateStatus() {
         switch phase {
         case .searching where postsCoolingSeconds > 0 && !postsBlocked:
-            statusText = "抖音暂时限制了读取创作者作品，正在用话题页继续找（\(postsCoolingSeconds) 秒后恢复）"
+            statusText = "抖音暂时限制了读取创作者作品，正在用热门话题页继续找（\(Self.fmtWait(postsCoolingSeconds))后自动重试）"
         case .searching:
             if postsBlocked {
                 statusText = "未登录 · 正在推荐流里筛选 \(window) 的视频（已翻 \(stats.feedPages) 页）"
@@ -1289,6 +1332,8 @@ final class TimeMachineEngine {
             }
         case .idle:
             statusText = "候选池里还有 \(candidates.count) 条"
+        case .waitingMore where postsCoolingSeconds > 0 && !postsBlocked:
+            statusText = "抖音暂时限制了读取创作者作品（风控，通常几小时内自动解除）。这个时间段的热门话题已经翻完，\(Self.fmtWait(postsCoolingSeconds))后会自动接着找；也可以先换个时间段看看。"
         case .waitingMore:
             statusText = items.isEmpty ? "这个时间段暂时没找到视频，可以继续寻找或换个时间" : "暂时找不到更多，可以继续寻找"
         case .exhausted:
@@ -1303,6 +1348,10 @@ final class TimeMachineEngine {
     }
 
     // MARK: - 工具
+
+    static func fmtWait(_ seconds: Int) -> String {
+        seconds >= 90 ? "\((seconds + 59) / 60) 分钟" : "\(seconds) 秒"
+    }
 
     /// Beta(α, β) 抽样（两次 Gamma 抽样）
     static func betaSample(_ a: Double, _ b: Double) -> Double {

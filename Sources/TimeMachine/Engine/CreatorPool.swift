@@ -26,6 +26,8 @@ struct Creator: Codable, Identifiable {
     var hotScore: Double?
     var followerCount: Int?
     var isInstitution: Bool?
+    /// 见过的这位创作者最早的一条作品时间：早于目标时间段结束，说明那时候已经在发作品了
+    var oldestSeenTS: Int?
 
     /// 普通人（素人）创作者：非机构、粉丝不过百万（未知时按作品热度判断）
     var isAmateur: Bool {
@@ -126,6 +128,17 @@ struct CreatorPool: Codable {
 
     func eligible(for window: TimeWindow) -> [Creator] {
         creators.values.filter { isEligible($0, for: window) }
+    }
+
+    /// 从任意一批视频里记录每位作者见过的最早作品时间
+    mutating func noteSeen(_ list: [Aweme]) {
+        for a in list where a.createTime > 0 {
+            guard var c = creators[a.author.secUid] else { continue }
+            if c.oldestSeenTS == nil || a.createTime < c.oldestSeenTS! {
+                c.oldestSeenTS = a.createTime
+                creators[a.author.secUid] = c
+            }
+        }
     }
 
     mutating func update(_ sec: String, _ body: (inout Creator) -> Void) {
