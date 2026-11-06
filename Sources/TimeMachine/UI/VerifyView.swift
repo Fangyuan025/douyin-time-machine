@@ -14,13 +14,16 @@ struct VerifyView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("抖音需要确认你不是机器人")
                         .font(.system(size: 14, weight: .bold))
-                    Text("请在下方完成抖音的安全验证（通常只需要一次）。完成后这个窗口会自动关闭，内容会接着加载。")
+                    Text("请在下方完成抖音的安全验证。完成后窗口会自动关闭、内容接着加载；如果紧接着又出现一个，说明之前有请求在排队，再完成一次即可。")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
-                Button("关闭") { dismissWindow(id: "verify") }
+                Button("稍后再说") {
+                    model.bridge.userDismissedVerification()
+                    dismissWindow(id: "verify")
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
@@ -31,6 +34,10 @@ struct VerifyView: View {
         .preferredColorScheme(.dark)
         .onChange(of: model.bridge.verificationNeeded) { _, needed in
             if !needed { dismissWindow(id: "verify") }
+        }
+        .onDisappear {
+            // 用窗口按钮关掉，也算“稍后再说”
+            if model.bridge.verificationNeeded { model.bridge.userDismissedVerification() }
         }
     }
 }

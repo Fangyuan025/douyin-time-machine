@@ -39,7 +39,7 @@ final class AppModel {
     var hideSeen: Bool { didSet { engine.hideSeen = hideSeen; UserDefaults.standard.set(hideSeen, forKey: "hideSeen") } }
     /// 推荐风格：0 = 热门多元，1 = 更懂我（偏好权重）
     var personalization: Double { didSet { engine.prefWeight = personalization; UserDefaults.standard.set(personalization, forKey: "personalization") } }
-    var requestInterval: Double { didSet { bridge.minInterval = requestInterval; UserDefaults.standard.set(requestInterval, forKey: "requestInterval3") } }
+    var requestInterval: Double { didSet { bridge.minInterval = requestInterval; UserDefaults.standard.set(requestInterval, forKey: "requestInterval4") } }
 
     @ObservationIgnored weak var mainWindow: NSWindow?
     /// 用户在队列末尾按了“下一条”，新视频一到就自动切过去
@@ -61,7 +61,7 @@ final class AppModel {
         self.engine = TimeMachineEngine(api: api, window: TimeWindow(from: from, to: to))
         self.autoAdvance = d.object(forKey: "autoAdvance") as? Bool ?? true
         self.hideSeen = d.object(forKey: "hideSeen") as? Bool ?? true
-        self.requestInterval = d.object(forKey: "requestInterval3") as? Double ?? 0.55
+        self.requestInterval = d.object(forKey: "requestInterval4") as? Double ?? 0.9
         self.history = Store.load([HistoryEntry].self, "history.json") ?? []
         self.personalization = d.object(forKey: "personalization") as? Double ?? 0.35
 

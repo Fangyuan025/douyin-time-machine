@@ -180,7 +180,8 @@ final class TimeMachineEngine {
     @ObservationIgnored private var followMaxTime = 0
     @ObservationIgnored private var likesCursor = 0
 
-    private let workerCount = 3
+    private let workerCount = 2
+    private static let useSearch = false
     /// 提前排进播放队列的条数（其余留在候选池里，切换时按最新兴趣重排）
     private let aheadTarget = 3
 
@@ -426,6 +427,11 @@ final class TimeMachineEngine {
         while generation == gen, !stopFlag, budget > 0, !Task.isCancelled {
             promote(force: false)
             if aheadCount >= aheadTarget && poolHealthy { return }
+            // 用户正在完成抖音验证时，后台完全暂停，避免继续累积风控
+            if api.bridge.verificationNeeded {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                continue
+            }
             let backoff = backoffUntil.timeIntervalSinceNow
             if backoff > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(min(backoff, 30) * 1_000_000_000))
@@ -523,7 +529,9 @@ final class TimeMachineEngine {
         let r = Double.random(in: 0..<1)
         // 搜索与话题页是找“当时大家在看什么”最有效的途径；搜索最容易触发安全验证，所以限频：
         // 每个时间段最多 12 次，两次之间至少隔 8 秒
-        let canSearch = !searchDisabled && searchesThisWindow < 12 && !searchQueue.isEmpty
+        // 后台不再使用搜索：抖音搜索极易触发人机验证，而且会在后台页面里留下待完成的验证码，
+        // 导致用户查看评论回复时连续弹验证。找时代内容改用更稳定的话题页。
+        let canSearch = Self.useSearch && !searchDisabled && searchesThisWindow < 12 && !searchQueue.isEmpty
             && Date().timeIntervalSince(lastSearchAt) > 8
         // 候选池里热点已经过半时先不翻话题页，去补充当时的其他热门内容
         let eraHeavy = candidates.count >= 6 && eraShare > 0.45
@@ -552,7 +560,7 @@ final class TimeMachineEngine {
         if canTopic { return nextTopic() }
         if !relatedQueue.isEmpty { return .related(relatedQueue.removeFirst()) }
         if feedPagesThisWindow < 30 { return .feed }
-        if seedBusy || inflight > 0 || (!searchQueue.isEmpty && !searchDisabled && searchesThisWindow < 12) { return .wait }
+        if seedBusy || inflight > 0 || (Self.useSearch && !searchQueue.isEmpty && !searchDisabled && searchesThisWindow < 12) { return .wait }
         return nil
     }
 

@@ -125,7 +125,7 @@ struct CommentsPanel: View {
         } catch {
             var cur = replies[c.id] ?? st
             cur.loading = false
-            cur.error = "回复加载失败。若弹出了抖音验证，请先完成再重试。"
+            cur.error = "需要先完成抖音的安全验证才能查看回复"
             replies[c.id] = cur
         }
     }
@@ -202,7 +202,16 @@ private struct RepliesSection: View {
                 }
             }
             if let err = state.error {
-                Text(err).font(.system(size: 11)).foregroundStyle(Theme.accent2)
+                HStack(spacing: 8) {
+                    Text(err).font(.system(size: 11)).foregroundStyle(Theme.accent2)
+                    Button("去验证") {
+                        AppModel.shared.bridge.allowVerificationPopup()
+                        onLoad()
+                    }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.primary)
+                }
             }
             HStack(spacing: 14) {
                 if state.loading {
@@ -211,8 +220,8 @@ private struct RepliesSection: View {
                 } else if !state.expanded {
                     replyButton("展开 \(comment.replyCount) 条回复", icon: "chevron.down", action: onLoad)
                 } else {
-                    if state.hasMore || state.error != nil {
-                        replyButton(state.error != nil ? "重试" : "展开更多回复", icon: "chevron.down", action: onLoad)
+                    if state.hasMore && state.error == nil {
+                        replyButton("展开更多回复", icon: "chevron.down", action: onLoad)
                     }
                     replyButton("收起", icon: "chevron.up", action: onCollapse)
                 }

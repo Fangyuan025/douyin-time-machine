@@ -65,6 +65,8 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
     private(set) var verificationNeeded = false
     @ObservationIgnored var onVerificationNeeded: (() -> Void)?
     @ObservationIgnored private var verificationWatch: Task<Void, Never>?
+    /// 用户手动关掉验证窗口的时间：之后 1 分钟内不再自动弹出
+    @ObservationIgnored private var dismissedAt = Date.distantPast
 
     /// 两次请求之间的最小间隔（秒）
     @ObservationIgnored var minInterval: TimeInterval = 0.45
@@ -233,22 +235,41 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
         return (r as? Bool) == true || (r as? NSNumber)?.boolValue == true
     }
 
-    /// 交互式请求挂起时，检查是否弹出了验证；弹出就通知界面打开验证窗口，用户完成后自动收起
-    private func watchForVerification() {
+    /// 用户手动关闭验证窗口
+    func userDismissedVerification() {
+        dismissedAt = Date()
+        verificationNeeded = false
+    }
+
+    /// 用户主动重试（如点「去验证」）：解除冷却，需要时允许立即弹出验证窗口
+    func allowVerificationPopup() {
+        dismissedAt = .distantPast
+    }
+
+    /// 交互式请求挂起时，检查是否弹出了验证；弹出就通知界面打开验证窗口。
+    /// 验证框消失后再等 2.5 秒确认没有新的验证接踵而来，才收起窗口（避免窗口反复开关）
+    private func watchForVerification(initialDelay: Double = 2.5) {
         verificationWatch?.cancel()
         verificationWatch = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(initialDelay * 1_000_000_000))
+            var goneSince: Date?
             while let self, !Task.isCancelled {
                 let visible = await self.captchaVisible()
-                if visible && !self.verificationNeeded {
-                    self.verificationNeeded = true
-                    log("抖音弹出了人机验证，请在弹出的窗口里完成")
-                    self.onVerificationNeeded?()
-                } else if !visible && self.verificationNeeded {
-                    self.verificationNeeded = false
-                    log("验证已完成")
+                if visible {
+                    goneSince = nil
+                    if !self.verificationNeeded && Date().timeIntervalSince(self.dismissedAt) > 60 {
+                        self.verificationNeeded = true
+                        log("抖音弹出了人机验证，请在弹出的窗口里完成")
+                        self.onVerificationNeeded?()
+                    }
+                } else if self.verificationNeeded {
+                    if goneSince == nil { goneSince = Date() }
+                    if let g = goneSince, Date().timeIntervalSince(g) > 2.5 {
+                        self.verificationNeeded = false
+                        log("验证已完成")
+                    }
                 }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                try? await Task.sleep(nanoseconds: 700_000_000)
             }
         }
     }
@@ -316,7 +337,7 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
                 defer {
                     if interactive {
                         verificationWatch?.cancel()
-                        if verificationNeeded { verificationNeeded = false }
+                        verificationNeeded = false
                     }
                 }
                 let raw = try await evaluate(Self.requestJS, arguments: args, timeout: Double(jsTimeout) / 1000 + 5)
