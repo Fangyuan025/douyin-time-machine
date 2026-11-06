@@ -2,12 +2,25 @@
 
 按**发布时间**刷抖音：选择任意年份/月份（精确到月，支持跨月、跨年区间），时光机会为你生成一条只包含该时间段视频的 FYP 式视频流。
 
+## 下载安装
+
+到 [Releases](https://github.com/Fangyuan025/douyin-time-machine/releases/latest) 下载 `TimeMachine-*-macOS-universal.zip`，解压后把「时光机.app」拖进「应用程序」。需要 macOS 14 或更高版本，Apple Silicon 和 Intel 都能用。
+
+App 没有经过 Apple 公证，第一次打开会被系统拦下。可以在「系统设置 → 隐私与安全性」底部点「仍要打开」，或者在终端执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/时光机.app
+```
+
+打开后用抖音 App 扫码登录，再在左侧选择年份和月份。
+
 ## 构建与运行
 
 需要 macOS 14+、Xcode 15+（Swift 5.10+）。
 
 ```bash
 ./scripts/build_app.sh          # 生成 build/时光机.app（release）
+./scripts/build_app.sh release universal   # 同时支持 Apple Silicon 与 Intel
 open build/时光机.app
 ```
 

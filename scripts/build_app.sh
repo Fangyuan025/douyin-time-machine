@@ -1,17 +1,20 @@
 #!/bin/zsh
-# 构建「时光机.app」：./scripts/build_app.sh [debug|release]
+# 构建「时光机.app」：./scripts/build_app.sh [debug|release] [universal]
+# 第二个参数为 universal 时同时编译 Apple Silicon 与 Intel（发布用）
 set -euo pipefail
 
 CONFIG="${1:-release}"
+ARCH_FLAGS=()
+[[ "${2:-}" == "universal" ]] && ARCH_FLAGS=(--arch arm64 --arch x86_64)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/build/时光机.app"
 BUNDLE_ID="app.timemachine.douyin"
 VERSION="1.0.0"
 
 cd "$ROOT"
-echo "▸ swift build -c $CONFIG"
-swift build -c "$CONFIG"
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/TimeMachine"
+echo "▸ swift build -c $CONFIG ${ARCH_FLAGS[*]}"
+swift build -c "$CONFIG" "${ARCH_FLAGS[@]}"
+BIN="$(swift build -c "$CONFIG" "${ARCH_FLAGS[@]}" --show-bin-path)/TimeMachine"
 
 echo "▸ 组装 $APP"
 rm -rf "$APP"
