@@ -49,8 +49,10 @@ final class TimeMachineEngine {
 
     private struct Candidate {
         var aweme: Aweme
-        /// 与兴趣无关的静态分：热度 + 来源 + 同作者内排名
-        var base: Double
+        /// 热度：log10(点赞 + 2×评论 + 2×分享 + 1)
+        var heat: Double
+        /// 来源加分（很小，热度才是主角）
+        var sourceBonus: Double
         /// 固定的随机扰动（探索）
         var jitter: Double
         var source: CreatorSource?
@@ -103,6 +105,14 @@ final class TimeMachineEngine {
     @ObservationIgnored private var monthCount: [Int: Int] = [:]
     /// 本次航程里被标记“不感兴趣”的作者
     @ObservationIgnored private var mutedAuthors = Set<String>()
+    /// 本次航程每位作者进入候选池的视频数（每人最多 3 条，保证广度）
+    @ObservationIgnored private var authorFound: [String: Int] = [:]
+    /// 本次航程所有候选的热度（已排序），用来算“在这个时间段里有多火”的百分位
+    @ObservationIgnored private var heatSamples: [Double] = []
+    /// 因为“符合偏好”而入队的视频（用来限制连续投喂同类）
+    @ObservationIgnored private var prefDrivenIDs = Set<String>()
+    /// 个性化程度：0 = 只看热度与多样性，1 = 更多按偏好推荐（默认 0.35：热门多元为主）
+    @ObservationIgnored var prefWeight: Double = 0.35
     @ObservationIgnored private var fillTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var feedRefreshIndex = Int.random(in: 1...5)
@@ -158,6 +168,9 @@ final class TimeMachineEngine {
         authorCount = [:]
         monthCount = [:]
         mutedAuthors = []
+        authorFound = [:]
+        heatSamples = []
+        prefDrivenIDs = []
         stats = Stats()
         feedPagesThisWindow = 0
         searchesThisWindow = 0
@@ -249,7 +262,7 @@ final class TimeMachineEngine {
     /// 候选池是否足够支撑接下来的推荐（数量够、作者够分散）
     private var poolHealthy: Bool {
         guard candidates.count >= 10 else { return false }
-        return Set(candidates.lazy.map(\.aweme.author.secUid)).count >= 5
+        return Set(candidates.lazy.map(\.aweme.author.secUid)).count >= 8
     }
 
     // MARK: - 学习
@@ -453,12 +466,10 @@ final class TimeMachineEngine {
         return nil
     }
 
-    /// Thompson 采样：每位创作者“扫描一次能出片”的概率 θ ~ Beta(α, β)，
-    /// 抽样后取最大者。高产的人更常被选中，没试过的新人也有机会。
+    /// Thompson 采样：每位创作者“扫描一次能出片”的概率 θ ~ Beta(α, β)，再乘以“作品热度”系数，取最大者。
+    /// 目标是广度：多扫不同的、作品火的创作者，而不是反复翻你已经喜欢的那几个人。
     private func pickCreator(_ list: [Creator]) -> Creator {
         let sample = list.count > 400 ? Array(list.shuffled().prefix(400)) : list
-        var backlog: [String: Int] = [:]
-        for c in candidates { backlog[c.aweme.author.secUid, default: 0] += 1 }
         let range = window.monthIndices
 
         var best = sample[0]
@@ -470,21 +481,25 @@ final class TimeMachineEngine {
             var beta = 1 + bad * 0.7
             // 先验：已知在这个时间段发过作品 → 几乎必中
             if let ms = c.activeMonths {
-                if ms.contains(where: { range.contains($0) }) { alpha += 6 }
+                if ms.contains(where: { range.contains($0) }) { alpha += 3 }
             } else if let ys = c.activeYears, ys.contains(where: { window.years.contains($0) }) {
-                alpha += 2
+                alpha += 1.5
             }
-            if c.followed { alpha += 1 }
-            if c.sources.contains(.liked) { alpha += 1 }
-            if c.sources.contains(.search) { alpha += 1 }      // 年代热梗搜出来的，多半是当年活跃的
+            // 探索：池子里还没扫过的人加一点分，避免总是翻那几个“已知高产”的人
+            if c.queries == 0 { alpha += 1 }
+            if c.sources.contains(.search) { alpha += 1.5 }   // 年代热梗按点赞搜出来的：当年的热门创作者
             if c.sources.contains(.mention) { alpha += 0.5 }
+            if c.followed { alpha += 0.3 }
+            if c.sources.contains(.liked) { alpha += 0.3 }
+            // 偏好只轻微影响“挑谁来扫”，避免总在喜欢的几个人里打转；但讨厌的人明显降权
             let affinity = interest.authors[c.secUid] ?? 0
-            if affinity > 0 { alpha += min(3, affinity * 0.4) } else { beta += min(4, -affinity * 0.5) }
+            if affinity > 0 { alpha += min(1, affinity * 0.1) } else { beta += min(4, -affinity * 0.5) }
 
             var value = Self.betaSample(alpha, beta)
-            // 已经积压了好几条候选的创作者先别继续翻，把请求留给新的创作者
-            let pending = backlog[c.secUid, default: 0] + (authorCount[c.secUid] ?? 0)
-            if pending >= 3 { value *= 0.15 }
+            // 作品越火的创作者越优先（没有数据时按中性处理）
+            let hot = min(2.5, max(-2, (c.hotScore ?? 3.2) - 3.2))
+            value *= 1 + 0.25 * hot
+            if (authorFound[c.secUid] ?? 0) >= 2 { value *= 0.1 }
             if value > bestValue { bestValue = value; best = c }
         }
         return best
@@ -619,6 +634,10 @@ final class TimeMachineEngine {
             if let years { cr.activeYears = years }
             if let months { cr.activeMonths = months }
             if !inWindow.isEmpty { cr.goodScans = (cr.goodScans ?? 0) + 1 }
+            if !dated.isEmpty {
+                let mean = dated.map { Self.heat($0) }.reduce(0, +) / Double(dated.count)
+                cr.hotScore = cr.hotScore.map { $0 * 0.6 + mean * 0.4 } ?? mean
+            }
             if let oldest = dated.map(\.createTime).min(), !page.hasMore {
                 cr.firstPostTS = oldest
             } else if dated.isEmpty && !page.hasMore {
@@ -664,120 +683,173 @@ final class TimeMachineEngine {
         }
         prog.coveredMonths = covered.sorted()
         prog.monthCursor = cursors.isEmpty ? nil : cursors
-        if covered.count >= w.monthCount || prog.pages >= 10 { prog.exhausted = true }
+        // 广度优先：每位创作者在一个时间段里最多贡献 3 条、最多翻 3 页
+        if covered.count >= w.monthCount || prog.pages >= 3 || (authorFound[c.secUid] ?? 0) >= 3 { prog.exhausted = true }
         if !prog.exhausted, chooseMonth(for: pool.creators[c.secUid] ?? c, w, prog) == nil { prog.exhausted = true }
         pool.setProgress(prog, w, c.secUid)
         log("扫描 @\(c.nickname)（\(monthYM.short)）：\(page.awemes.count) 条，命中 \(hits)")
     }
 
-    /// 把一批命中的视频加入候选池。同一批里按点赞数排名，排名靠后的降权（同一个人的作品优先推最好的）
+    static func heat(_ a: Aweme) -> Double {
+        log10(Double(a.diggCount) + 2 * Double(a.commentCount) + 2 * Double(a.shareCount) + 1)
+    }
+
+    /// 这条视频在本次航程所有候选里的热度百分位（0~1），不同年代之间也可比
+    private func hotPercentile(_ heat: Double) -> Double {
+        guard heatSamples.count >= 8 else { return min(1, max(0, (heat - 2.5) / 3.5)) }
+        var lo = 0, hi = heatSamples.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if heatSamples[mid] < heat { lo = mid + 1 } else { hi = mid }
+        }
+        return Double(lo) / Double(heatSamples.count)
+    }
+
+    /// 把一批命中的视频加入候选池。每位作者每批最多取最火的 2 条、整个航程最多 3 条——宁可多扫几个人，也不让一个人刷屏
     @discardableResult
     private func addHits(_ list: [Aweme], source: CreatorSource?, keyword: String? = nil, viaScan: Bool = false) -> Int {
         var added = 0
-        let ranked = list.filter(\.isPlayable).sorted { $0.diggCount > $1.diggCount }
-        var rankByAuthor: [String: Int] = [:]
+        let ranked = list.filter(\.isPlayable).sorted { Self.heat($0) > Self.heat($1) }
+        var perBatch: [String: Int] = [:]
         for a in ranked {
             let sec = a.author.secUid
             guard !knownIDs.contains(a.id), !mutedAuthors.contains(sec) else { continue }
             if hideSeen && seen.contains(a.id) { continue }
             if followOnly && pool.creators[sec]?.followed != true { continue }
+            if perBatch[sec, default: 0] >= 2 || authorFound[sec, default: 0] >= 3 { continue }
             knownIDs.insert(a.id)
+            perBatch[sec, default: 0] += 1
+            authorFound[sec, default: 0] += 1
             stats.hits += 1
-            let rank = rankByAuthor[sec, default: 0]
-            rankByAuthor[sec] = rank + 1
 
-            var base = log10(Double(a.diggCount) + 10) * 0.5
+            let h = Self.heat(a)
+            var bonus = 0.0
             switch source {
-            case .following?: base += 1.2
-            case .liked?: base += 0.9
-            case .feed?: base += 0.5
-            case .search?: base += 0.5
-            case .mention?: base += 0.3
-            case .related?: base += 0.3
+            case .following?: bonus = 0.06
+            case .liked?: bonus = 0.05
+            case .search?: bonus = 0.05
             default: break
             }
-            if source != .following && pool.creators[sec]?.followed == true { base += 0.8 }
-            base -= min(2, Double(rank) * 0.25)
-            candidates.append(Candidate(aweme: a, base: base, jitter: Double.random(in: 0...0.8),
+            if source != .following && pool.creators[sec]?.followed == true { bonus += 0.04 }
+            candidates.append(Candidate(aweme: a, heat: h, sourceBonus: bonus, jitter: Double.random(in: 0...0.12),
                                         source: source, keyword: keyword, viaScan: viaScan))
+            let pos = heatSamples.firstIndex(where: { $0 >= h }) ?? heatSamples.count
+            heatSamples.insert(h, at: pos)
             monthCount[a.monthIndex, default: 0] += 1
             added += 1
         }
         return added
     }
 
-    /// 即时动态打分：静态分 + 当前兴趣画像 + 打散惩罚
-    private func liveScore(_ c: Candidate) -> Double {
-        let a = c.aweme
-        var s = c.base + c.jitter + interest.score(a) * 1.3
-        s -= Double(authorCount[a.author.secUid, default: 0]) * 0.9
-        // 内容分类打散：和最近两条同一大类就降权
-        if let cat = a.primaryCategory {
-            let lastCats = items.suffix(2).compactMap(\.primaryCategory)
-            s -= Double(lastCats.filter { $0 == cat }.count) * 0.6
-        }
-        // 多月时间段：最近几条都在同一个月就降权，让时间分布更均匀
-        if window.monthCount > 1 {
-            let m = a.monthIndex
-            s -= Double(items.suffix(4).filter { $0.monthIndex == m }.count) * 0.4
-        }
-        return s
+    private struct ScoreParts {
+        var total: Double
+        var hot: Double
+        var pref: Double
+        var novel: Bool
     }
 
-    private func reason(for c: Candidate) -> String {
+    /// 即时打分 = 热度百分位（主）+ 偏好（辅，可调）+ 新鲜分类加分 + 打散惩罚
+    private func liveScore(_ c: Candidate) -> ScoreParts {
         let a = c.aweme
-        if c.source == .following || pool.creators[a.author.secUid]?.followed == true { return "你关注的人" }
-        if (interest.authors[a.author.secUid] ?? 0) > 2 { return "你常看 TA 的视频" }
-        if let m = interest.strongestMatch(a) { return "因为你爱看\(m)" }
-        if a.diggCount >= 1_000_000 { return "当年爆款 · \(Fmt.count(a.diggCount))赞" }
+        let hot = hotPercentile(c.heat)
+        let pref = max(-1, min(1, interest.score(a) / 3))
+        var s = hot + prefWeight * pref + c.sourceBonus + c.jitter
+
+        // 新鲜度：最近 10 条里没出现过的内容大类加分，鼓励多元
+        var novel = false
+        if let cat = a.primaryCategory {
+            let recentCats = items.suffix(10).compactMap(\.primaryCategory)
+            let n = recentCats.filter { $0 == cat }.count
+            novel = n == 0
+            s += n == 0 ? 0.25 : (n == 1 ? 0.1 : 0)
+            if items.last?.primaryCategory == cat { s -= 0.25 }
+            if items.suffix(5).filter({ $0.primaryCategory == cat }).count >= 2 { s -= 0.35 }
+        } else {
+            s += 0.1
+        }
+        // 不连续投喂“同口味”：最近两条都是因偏好入队的，这条若又主要靠偏好就降权
+        if pref > 0.4 {
+            let lastTwo = items.suffix(2).map(\.id)
+            if lastTwo.count == 2 && lastTwo.allSatisfy({ prefDrivenIDs.contains($0) }) { s -= 0.4 }
+        }
+        // 明确讨厌的作者无论滑块怎么调都压下去
+        if (interest.authors[a.author.secUid] ?? 0) <= -3 { s -= 1 }
+        s -= Double(authorCount[a.author.secUid, default: 0]) * 0.5
+        if window.monthCount > 1 {
+            let m = a.monthIndex
+            s -= Double(items.suffix(4).filter { $0.monthIndex == m }.count) * 0.15
+        }
+        return ScoreParts(total: s, hot: hot, pref: pref, novel: novel)
+    }
+
+    private func reason(for c: Candidate, _ parts: ScoreParts) -> String {
+        let a = c.aweme
+        let followed = c.source == .following || pool.creators[a.author.secUid]?.followed == true
+        if parts.hot >= 0.8 { return "当时的热门 · \(Fmt.count(a.diggCount))赞\(followed ? " · 你关注的" : "")" }
+        if followed { return "你关注的人" }
+        // 主要靠偏好入队
+        if parts.pref > 0.4 && prefWeight * parts.pref >= parts.hot * 0.5 {
+            if (interest.authors[a.author.secUid] ?? 0) > 2 { return "你常看 TA 的视频" }
+            if let m = interest.strongestMatch(a) { return "因为你爱看\(m)" }
+        }
+        if parts.hot >= 0.8 { return "当时的热门 · \(Fmt.count(a.diggCount))赞" }
+        if let kw = c.keyword, c.source == .search { return "当年热梗：\(kw)" }
+        if parts.novel, let cat = a.primaryCategory, items.count >= 3 { return "换换口味 · \(cat)" }
         if c.viaScan {
             switch c.source {
             case .liked?: return "你点赞过 TA 的作品"
             case .search?: return "当年的热门创作者"
             case .mention?: return "被当年的视频 @ 过"
-            case .related?: return "和你看过的内容相似"
+            case .related?: return "相似创作者"
             case .feed?: return "抖音给你推荐过 TA"
             default: return "时光机为你发现"
             }
         }
         switch c.source {
         case .liked?: return "你点赞过的视频"
-        case .search?: return c.keyword.map { "当年热梗：\($0)" } ?? "当年热门"
-        case .related?: return "相似内容"
+        case .related?: return "相关推荐"
         case .feed?: return "来自你的推荐流"
         default: return "时光机为你发现"
         }
     }
 
-    /// 把候选挪进播放队列（只提前排 aheadTarget 条），并严格打散作者：
-    /// - 硬规则：相邻两条绝不是同一个作者；
-    /// - 软规则：最近 5 条里同一作者最多一次，除非用户马上没得看了。
+    /// 把候选挪进播放队列（只提前排 aheadTarget 条），严格打散作者：
+    /// - 同一作者 20 条内最多出现一次，一次航程最多 2 条；
+    /// - 只有用户马上没得看、且引擎已经找不到新作者时，才逐级放宽（6 条内不重复 → 3 条内不重复）。
     private func promote(force final: Bool) {
         var changed = false
         while aheadCount < aheadTarget, !candidates.isEmpty {
             let urgent = aheadCount == 0
             if !urgent && !final && candidates.count < 3 { break }
-            let last = items.last?.author.secUid
-            let recent = items.suffix(5).map(\.author.secUid)
-            var bestIdx: Int?
-            var bestScore = -Double.infinity
-            var bestRecent = false
-            for (i, c) in candidates.enumerated() {
-                let a = c.aweme.author.secUid
-                if a == last { continue }
-                let inRecent = recent.contains(a)
-                var s = liveScore(c)
-                if inRecent { s -= 4 }
-                if s > bestScore { bestScore = s; bestIdx = i; bestRecent = inRecent }
+
+            func best(spacing: Int, cap: Int) -> (Int, ScoreParts)? {
+                let recent = Set(items.suffix(spacing).map(\.author.secUid))
+                var bestIdx: Int?
+                var bestParts: ScoreParts?
+                for (i, c) in candidates.enumerated() {
+                    let sec = c.aweme.author.secUid
+                    if recent.contains(sec) || authorCount[sec, default: 0] >= cap { continue }
+                    let parts = liveScore(c)
+                    if parts.total > (bestParts?.total ?? -Double.infinity) { bestIdx = i; bestParts = parts }
+                }
+                guard let bestIdx, let bestParts else { return nil }
+                return (bestIdx, bestParts)
             }
-            guard let idx = bestIdx else { break }
-            if bestRecent && !urgent { break }
+
+            var choice = best(spacing: 20, cap: 2)
+            // 只有在引擎已经找不到新作者时（搜寻结束）才逐级放宽；还在搜寻时宁可让用户等一下
+            let canRelax = urgent && (final || fillTask == nil)
+            if choice == nil && canRelax { choice = best(spacing: 6, cap: 2) }
+            if choice == nil && canRelax { choice = best(spacing: 3, cap: 3) }
+            guard let (idx, parts) = choice else { break }
+
             let c = candidates.remove(at: idx)
             var a = c.aweme
-            a.reason = reason(for: c)
+            a.reason = reason(for: c, parts)
+            if parts.pref > 0.4 && prefWeight * parts.pref >= parts.hot * 0.5 { prefDrivenIDs.insert(a.id) }
             authorCount[a.author.secUid, default: 0] += 1
             items.append(a)
-            log("入队 #\(items.count)：@\(a.author.nickname)（\(Fmt.dayFormatter.string(from: a.date))\(a.primaryCategory.map { " · \($0)" } ?? "")）\(a.reason ?? "")")
+            log("入队 #\(items.count)：@\(a.author.nickname)（\(Fmt.dayFormatter.string(from: a.date))\(a.primaryCategory.map { " · \($0)" } ?? "")）热度 \(Int(parts.hot * 100))% 偏好 \(String(format: "%+.2f", parts.pref)) · \(a.reason ?? "")")
             changed = true
         }
         if changed { onItemsChanged?() }

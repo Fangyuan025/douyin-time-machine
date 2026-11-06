@@ -22,6 +22,8 @@ struct Creator: Codable, Identifiable {
     var queries: Int = 0
     /// 扫描后至少命中一条的次数（Thompson 采样的成功次数）
     var goodScans: Int?
+    /// 作品热度（log10 互动量的滑动平均），用来优先挑“作品更火”的创作者
+    var hotScore: Double?
 
     var id: String { secUid }
 

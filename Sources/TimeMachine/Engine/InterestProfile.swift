@@ -30,7 +30,7 @@ struct InterestProfile: Codable {
             case .uncollected: return -2.0
             case .openedComments: return 0.6
             case .openedAuthor: return 0.8
-            case .seed: return 1.2
+            case .seed: return 0.5
             case .notInterested: return -4.0
             }
         }

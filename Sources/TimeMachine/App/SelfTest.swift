@@ -122,6 +122,32 @@ enum SelfTest {
                 let order = engine.items.map(\.author.secUid)
                 let consecutive = zip(order, order.dropFirst()).contains { $0 == $1 }
                 print("\(consecutive ? "❌" : "✅") 作者打散（全年）：相邻同作者 = \(consecutive)")
+
+                // 模拟连刷 15 条：看实际刷到的内容有多元
+                // 模拟一个刷得很快的人：每 1.5 秒划一条
+                var consumed = 0, ticks = 0
+                while consumed < 15 && ticks < 160 {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    ticks += 1
+                    if engine.aheadCount > 0 { engine.move(by: 1); consumed += 1 }
+                }
+                let shown = Array(engine.items.prefix(engine.currentIndex + 1))
+                let authors = Set(shown.map(\.author.secUid)).count
+                let cats = Set(shown.compactMap(\.primaryCategory))
+                var reasons: [String: Int] = [:]
+                for a in shown { reasons[(a.reason ?? "-").components(separatedBy: " ·").first ?? "-", default: 0] += 1 }
+                var minGap = Int.max
+                var lastSeen: [String: Int] = [:]
+                for (i, a) in shown.enumerated() {
+                    if let j = lastSeen[a.author.secUid] { minGap = min(minGap, i - j) }
+                    lastSeen[a.author.secUid] = i
+                }
+                let diverse = shown.count >= 10 && Double(authors) >= Double(shown.count) * 0.85 && minGap >= 12
+                let followedShare = shown.filter { engine.pool.creators[$0.author.secUid]?.followed == true }.count
+                if !diverse { ok = false }
+                print("\(diverse ? "✅" : "❌") 连刷 \(shown.count) 条：\(authors) 位不同作者，\(cats.count) 个内容大类（\(cats.prefix(8).joined(separator: "、"))）")
+                print("   同一作者最小间隔：\(minGap == Int.max ? "无重复" : "\(minGap) 条")；其中来自关注的人：\(followedShare) 条")
+                print("   推荐理由分布：\(reasons.sorted { $0.value > $1.value }.map { "\($0.key)×\($0.value)" }.joined(separator: "  "))")
             }
             print(ok ? "SELFTEST PASS" : "SELFTEST DONE WITH FAILURES")
             fflush(stdout)

@@ -30,8 +30,20 @@ private struct GeneralSettings: View {
                     Slider(value: $player.volume, in: 0...1)
                 }
             }
-            Section("推荐") {
+            Section {
+                LabeledContent("推荐风格") {
+                    HStack(spacing: 8) {
+                        Text("热门多元").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Slider(value: $model.personalization, in: 0...1)
+                        Text("更懂我").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
                 Toggle("隐藏已经看过的视频", isOn: $model.hideSeen)
+            } header: {
+                Text("推荐")
+            } footer: {
+                Text("默认以「所选时间段里的热门内容」为主、尽量多元，偏好只做加减分；往右拖会更多按你的口味推荐。无论怎么调，同一作者 20 条内最多出现一次。")
+                    .foregroundStyle(.secondary)
             }
             Section {
                 LabeledContent("请求间隔") {

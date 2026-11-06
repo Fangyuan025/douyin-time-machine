@@ -37,6 +37,8 @@ final class AppModel {
     // 设置
     var autoAdvance: Bool { didSet { player.autoAdvance = autoAdvance; UserDefaults.standard.set(autoAdvance, forKey: "autoAdvance") } }
     var hideSeen: Bool { didSet { engine.hideSeen = hideSeen; UserDefaults.standard.set(hideSeen, forKey: "hideSeen") } }
+    /// 推荐风格：0 = 热门多元，1 = 更懂我（偏好权重）
+    var personalization: Double { didSet { engine.prefWeight = personalization; UserDefaults.standard.set(personalization, forKey: "personalization") } }
     var requestInterval: Double { didSet { bridge.minInterval = requestInterval; UserDefaults.standard.set(requestInterval, forKey: "requestInterval3") } }
 
     @ObservationIgnored weak var mainWindow: NSWindow?
@@ -61,9 +63,11 @@ final class AppModel {
         self.hideSeen = d.object(forKey: "hideSeen") as? Bool ?? true
         self.requestInterval = d.object(forKey: "requestInterval3") as? Double ?? 0.55
         self.history = Store.load([HistoryEntry].self, "history.json") ?? []
+        self.personalization = d.object(forKey: "personalization") as? Double ?? 0.35
 
         bridge.minInterval = requestInterval
         engine.hideSeen = hideSeen
+        engine.prefWeight = personalization
         player.autoAdvance = autoAdvance
         player.onEnded = { [weak self] in self?.next() }
         player.refresher = { [weak self] a in
