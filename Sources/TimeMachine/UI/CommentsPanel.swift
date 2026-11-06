@@ -8,6 +8,8 @@ struct CommentsPanel: View {
     @State private var loading = false
     @State private var total = 0
     @State private var error: String?
+    /// 每条评论的回复展开状态
+    @State private var replies: [String: ReplyState] = [:]
 
     var body: some View {
         let a = model.engine.current
@@ -45,7 +47,14 @@ struct CommentsPanel: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
                     ForEach(comments) { c in
-                        CommentRow(comment: c)
+                        VStack(alignment: .leading, spacing: 8) {
+                            CommentRow(comment: c)
+                            if c.replyCount > 0, let a {
+                                RepliesSection(comment: c, state: replies[c.id] ?? ReplyState(),
+                                               onLoad: { Task { await loadReplies(a, c) } },
+                                               onCollapse: { replies[c.id]?.expanded = false })
+                            }
+                        }
                     }
                     if let error {
                         VStack(spacing: 8) {
@@ -84,7 +93,40 @@ struct CommentsPanel: View {
             hasMore = true
             total = 0
             error = nil
+            replies = [:]
             await load(a, reset: true)
+        }
+    }
+
+    /// 展开 / 加载更多回复。若抖音弹出人机验证，会自动打开验证窗口，完成后接着加载
+    private func loadReplies(_ a: Aweme, _ c: Comment) async {
+        var st = replies[c.id] ?? ReplyState()
+        // 已经加载过、只是收起了：直接展开
+        if !st.expanded && !st.items.isEmpty {
+            st.expanded = true
+            replies[c.id] = st
+            return
+        }
+        guard !st.loading else { return }
+        st.loading = true
+        st.expanded = true
+        st.error = nil
+        replies[c.id] = st
+        do {
+            let page = try await model.api.commentReplies(awemeId: a.id, commentId: c.id, cursor: st.cursor)
+            guard model.engine.current?.id == a.id else { return }
+            var cur = replies[c.id] ?? st
+            let existing = Set(cur.items.map(\.id))
+            cur.items += page.comments.filter { !existing.contains($0.id) }
+            cur.cursor = page.cursor
+            cur.hasMore = page.hasMore && !page.comments.isEmpty
+            cur.loading = false
+            replies[c.id] = cur
+        } catch {
+            var cur = replies[c.id] ?? st
+            cur.loading = false
+            cur.error = "回复加载失败。若弹出了抖音验证，请先完成再重试。"
+            replies[c.id] = cur
         }
     }
 
@@ -125,11 +167,104 @@ private struct CommentRow: View {
                 HStack(spacing: 10) {
                     Text(Fmt.ago(comment.date))
                     if let ip = comment.ipLabel { Text(ip) }
-                    if comment.replyCount > 0 { Text("\(comment.replyCount) 条回复") }
                     Spacer()
                     Label(Fmt.count(comment.diggCount), systemImage: "heart")
                 }
                 .font(.system(size: 10.5))
+                .foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
+
+struct ReplyState {
+    var items: [Comment] = []
+    var cursor = 0
+    var hasMore = true
+    var loading = false
+    var expanded = false
+    var error: String?
+}
+
+/// 评论下面的回复区：展开 N 条回复 / 展开更多 / 收起
+private struct RepliesSection: View {
+    let comment: Comment
+    let state: ReplyState
+    let onLoad: () -> Void
+    let onCollapse: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if state.expanded {
+                ForEach(state.items) { r in
+                    ReplyRow(reply: r)
+                }
+            }
+            if let err = state.error {
+                Text(err).font(.system(size: 11)).foregroundStyle(Theme.accent2)
+            }
+            HStack(spacing: 14) {
+                if state.loading {
+                    ProgressView().controlSize(.mini)
+                    Text("正在加载回复…").font(.system(size: 11)).foregroundStyle(.secondary)
+                } else if !state.expanded {
+                    replyButton("展开 \(comment.replyCount) 条回复", icon: "chevron.down", action: onLoad)
+                } else {
+                    if state.hasMore || state.error != nil {
+                        replyButton(state.error != nil ? "重试" : "展开更多回复", icon: "chevron.down", action: onLoad)
+                    }
+                    replyButton("收起", icon: "chevron.up", action: onCollapse)
+                }
+            }
+        }
+        .padding(.leading, 42)
+    }
+
+    private func replyButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Rectangle().fill(Color.white.opacity(0.25)).frame(width: 16, height: 1)
+                Text(title)
+                Image(systemName: icon).font(.system(size: 9, weight: .bold))
+            }
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct ReplyRow: View {
+    let reply: Comment
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Avatar(url: reply.avatarURL, size: 24)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 4) {
+                    Text(reply.nickname)
+                    if let to = reply.replyTo {
+                        Image(systemName: "arrowtriangle.right.fill").font(.system(size: 7))
+                        Text(to)
+                    }
+                }
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                Text(reply.text)
+                    .font(.system(size: 12.5))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Text(Fmt.ago(reply.date))
+                    if let ip = reply.ipLabel { Text(ip) }
+                    Spacer()
+                    Label(Fmt.count(reply.diggCount), systemImage: "heart")
+                }
+                .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
             }
         }

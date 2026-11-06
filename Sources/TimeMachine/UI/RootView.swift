@@ -44,6 +44,9 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openLoginWindow)) { _ in
             openWindow(id: "login")
         }
+        .onReceive(NotificationCenter.default.publisher(for: .openVerifyWindow)) { _ in
+            openWindow(id: "verify")
+        }
         .onAppear {
             if !CommandLine.arguments.contains("--selftest") { model.start() }
         }

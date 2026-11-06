@@ -190,6 +190,8 @@ struct Comment: Identifiable, Hashable {
     var ipLabel: String?
     var nickname: String
     var avatarURL: URL?
+    /// 回复里“回复给谁”（楼中楼）
+    var replyTo: String?
 
     var date: Date { Date(timeIntervalSince1970: TimeInterval(createTime)) }
 
@@ -204,6 +206,8 @@ struct Comment: Identifiable, Hashable {
         ipLabel = ip.isEmpty ? nil : ip
         nickname = j["user"]["nickname"].string ?? "抖音用户"
         avatarURL = j["user"]["avatar_thumb"].urlList.first
+        let to = j["reply_to_username"].string ?? ""
+        replyTo = to.isEmpty ? nil : to
     }
 }
 

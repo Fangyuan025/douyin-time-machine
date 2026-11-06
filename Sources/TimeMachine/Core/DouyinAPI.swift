@@ -172,6 +172,24 @@ final class DouyinAPI {
             total: j["total"].int ?? 0)
     }
 
+    /// 某条评论下的回复
+    func commentReplies(awemeId: String, commentId: String, cursor: Int, count: Int = 10) async throws -> CommentPage {
+        // 查看回复常会触发抖音的人机验证，按交互式请求处理（会把验证交给用户完成）
+        let j = try await bridge.get("/aweme/v1/web/comment/list/reply/", [
+            "item_id": awemeId,
+            "comment_id": commentId,
+            "cut_version": "1",
+            "cursor": String(cursor),
+            "count": String(count),
+            "item_type": "0",
+        ], interactive: true)
+        return CommentPage(
+            comments: j["comments"].array.compactMap { Comment($0) },
+            hasMore: j["has_more"].bool ?? false,
+            cursor: j["cursor"].int ?? 0,
+            total: j["total"].int ?? 0)
+    }
+
     // MARK: 互动
 
     func digg(awemeId: String, on: Bool) async throws {

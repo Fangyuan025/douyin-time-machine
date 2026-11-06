@@ -77,6 +77,9 @@ final class AppModel {
             return fresh
         }
         engine.onItemsChanged = { [weak self] in self?.syncPlayer() }
+        bridge.onVerificationNeeded = {
+            NotificationCenter.default.post(name: .openVerifyWindow, object: nil)
+        }
     }
 
     // MARK: - 启动
@@ -403,4 +406,5 @@ final class AppModel {
 
 extension Notification.Name {
     static let openLoginWindow = Notification.Name("TimeMachine.openLoginWindow")
+    static let openVerifyWindow = Notification.Name("TimeMachine.openVerifyWindow")
 }

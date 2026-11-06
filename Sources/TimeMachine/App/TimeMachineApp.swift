@@ -78,6 +78,13 @@ struct TimeMachineApp: App {
         }
         .defaultSize(width: 1080, height: 760)
 
+        Window("抖音安全验证", id: "verify") {
+            VerifyView()
+                .environment(model)
+                .frame(minWidth: 760, minHeight: 560)
+        }
+        .defaultSize(width: 980, height: 700)
+
         Settings {
             SettingsView()
                 .environment(model)

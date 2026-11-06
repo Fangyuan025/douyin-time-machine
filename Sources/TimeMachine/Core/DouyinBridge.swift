@@ -61,6 +61,10 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     private(set) var state: State = .idle
     private(set) var requestCount = 0
+    /// 抖音弹出了人机验证，需要用户本人完成（例如查看评论回复时）
+    private(set) var verificationNeeded = false
+    @ObservationIgnored var onVerificationNeeded: (() -> Void)?
+    @ObservationIgnored private var verificationWatch: Task<Void, Never>?
 
     /// 两次请求之间的最小间隔（秒）
     @ObservationIgnored var minInterval: TimeInterval = 0.45
@@ -203,6 +207,52 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    // MARK: - 人机验证（交给用户本人完成）
+
+    /// 把后台网页临时放进验证窗口里，让用户亲自完成抖音的验证
+    func attachForVerification(to container: NSView) {
+        webView.removeFromSuperview()
+        webView.frame = container.bounds
+        webView.autoresizingMask = [.width, .height]
+        container.addSubview(webView)
+    }
+
+    func detachFromVerification() {
+        guard webView.superview != nil else { return }
+        webView.removeFromSuperview()
+        webView.autoresizingMask = []
+        webView.frame = NSRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
+    /// 页面上是否正显示着抖音的验证框
+    private func captchaVisible() async -> Bool {
+        let r = try? await evaluate("""
+            const f = [...document.querySelectorAll('iframe')].find(x => /verifycenter\\/captcha|rmc-nocaptcha|captcha/.test(x.src || '') && x.offsetParent !== null && x.getBoundingClientRect().height > 50);
+            return !!f;
+            """, timeout: 3)
+        return (r as? Bool) == true || (r as? NSNumber)?.boolValue == true
+    }
+
+    /// 交互式请求挂起时，检查是否弹出了验证；弹出就通知界面打开验证窗口，用户完成后自动收起
+    private func watchForVerification() {
+        verificationWatch?.cancel()
+        verificationWatch = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            while let self, !Task.isCancelled {
+                let visible = await self.captchaVisible()
+                if visible && !self.verificationNeeded {
+                    self.verificationNeeded = true
+                    log("抖音弹出了人机验证，请在弹出的窗口里完成")
+                    self.onVerificationNeeded?()
+                } else if !visible && self.verificationNeeded {
+                    self.verificationNeeded = false
+                    log("验证已完成")
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
     // MARK: - 脚本执行（带超时）
 
     /// callAsyncJavaScript 在页面刷新时可能永远不返回，这里用超时兜底
@@ -242,15 +292,15 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
-    func get(_ path: String, _ query: [String: String] = [:]) async throws -> J {
-        try await request("GET", path, query: query, form: nil)
+    func get(_ path: String, _ query: [String: String] = [:], interactive: Bool = false) async throws -> J {
+        try await request("GET", path, query: query, form: nil, interactive: interactive)
     }
 
     func post(_ path: String, query: [String: String] = [:], form: [String: String]) async throws -> J {
         try await request("POST", path, query: query, form: form)
     }
 
-    private func request(_ method: String, _ path: String, query: [String: String], form: [String: String]?) async throws -> J {
+    private func request(_ method: String, _ path: String, query: [String: String], form: [String: String]?, interactive: Bool = false) async throws -> J {
         var lastError: Error = DouyinError.notReady
         for attempt in 0..<2 {
             try await ensureReady()
@@ -258,9 +308,18 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
             if state != .ready { try await ensureReady() }
             requestCount += 1
             do {
-                var args: [String: Any] = ["method": method, "path": path, "query": query]
+                // 交互式请求（如查看评论回复）可能触发人机验证：给用户留出完成验证的时间
+                let jsTimeout = interactive ? 120_000 : 15_000
+                var args: [String: Any] = ["method": method, "path": path, "query": query, "timeoutMs": jsTimeout]
                 args["form"] = form ?? [:]
-                let raw = try await evaluate(Self.requestJS, arguments: args, timeout: 20)
+                if interactive { watchForVerification() }
+                defer {
+                    if interactive {
+                        verificationWatch?.cancel()
+                        if verificationNeeded { verificationNeeded = false }
+                    }
+                }
+                let raw = try await evaluate(Self.requestJS, arguments: args, timeout: Double(jsTimeout) / 1000 + 5)
                 return try parse(raw, path: path)
             } catch is CancellationError {
                 throw CancellationError()
@@ -383,8 +442,9 @@ final class DouyinBridge: NSObject, WKNavigationDelegate, WKUIDelegate {
         init.headers['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
         init.body = new URLSearchParams(form || {}).toString();
       }
-      const r = await withTimeout(fetch(url, init), 15000);
-      const text = await withTimeout(r.text(), 15000);
+      const limit = timeoutMs || 15000;
+      const r = await withTimeout(fetch(url, init), limit);
+      const text = await withTimeout(r.text(), limit);
       return { status: r.status, text };
     } catch (e) {
       return { status: 0, text: '', error: String(e && e.message || e) };
